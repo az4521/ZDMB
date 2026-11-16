@@ -1,10 +1,12 @@
 // @ts-check
 
 const mixin = require("@cloudrac3r/mixin-deep")
-const {guildToKState, ensureSpace, createSpace} = require("./create-space")
+const {guildToKState, ensureSpace, createSpace, syncSpaceExpressions} = require("./create-space")
 const {DEFAULT_PRIVACY_LEVEL} = require("./create-room")
 const {kstateStripConditionals, kstateUploadMxc} = require("../../matrix/kstate")
 const api = require("../../matrix/api")
+const file = require("../../matrix/file")
+const mreq = require("../../matrix/mreq")
 const {test} = require("supertape")
 const testData = require("../../../test/data")
 
@@ -62,4 +64,93 @@ test("guild2space: can generate kstate for a guild, passing privacy level 0", as
 			},
 		}
 	)
+})
+
+test("syncSpaceExpressions: sends the soundboard pack with the moe.crafty state type and state key", async t => {
+	const guildID = "999000000000000003"
+	const spaceID = "!soundspace:cadence.moe"
+	const passthroughDiscord = require("../../passthrough").discord
+	const realSendState = api.sendState
+	const realGetStateEvent = api.getStateEvent
+	const realUpload = file.uploadDiscordFileToMxc
+	/** @type {any[][]} */
+	const sent = []
+	db.prepare("INSERT INTO guild_active (guild_id, autocreate) VALUES (?, 1)").run(guildID) // guild_space references guild_active
+	db.prepare("INSERT INTO guild_space (guild_id, space_id, privacy_level) VALUES (?, ?, ?)").run(guildID, spaceID, 0)
+	passthroughDiscord.guilds.set(guildID, {id: guildID, name: "Sound space"})
+	// @ts-ignore
+	api.sendState = async (...args) => { sent.push(args) }
+	// @ts-ignore
+	api.getStateEvent = async () => { throw new mreq.MatrixServerError({errcode: "M_NOT_FOUND"}, 404) }
+	// @ts-ignore
+	file.uploadDiscordFileToMxc = async url => `mxc://cadence.moe/${url.split("/").pop()}`
+	try {
+		// @ts-ignore
+		await syncSpaceExpressions({guild_id: guildID, soundboard_sounds: [{sound_id: "5", name: "boop", volume: 1, emoji_id: null, emoji_name: null, guild_id: guildID, available: true}]}, false)
+		t.deepEqual(sent.map(([space, type, key, content]) => [space, type, key, Object.keys(content.sounds)]), [[spaceID, "moe.crafty.room_soundboard", "moe.crafty.zdmb.pack.sounds", ["boop"]]])
+	} finally {
+		api.sendState = realSendState
+		api.getStateEvent = realGetStateEvent
+		file.uploadDiscordFileToMxc = realUpload
+		passthroughDiscord.guilds.delete(guildID)
+		db.prepare("DELETE FROM guild_space WHERE guild_id = ?").run(guildID)
+		db.prepare("DELETE FROM guild_active WHERE guild_id = ?").run(guildID)
+	}
+})
+
+test("syncSpaceExpressions: deleting the last soundboard sound sends an empty pack when a pack exists", async t => {
+	const guildID = "999000000000000004"
+	const spaceID = "!soundspace2:cadence.moe"
+	const passthroughDiscord = require("../../passthrough").discord
+	const realSendState = api.sendState
+	const realGetStateEvent = api.getStateEvent
+	/** @type {any[][]} */
+	const sent = []
+	db.prepare("INSERT INTO guild_active (guild_id, autocreate) VALUES (?, 1)").run(guildID)
+	db.prepare("INSERT INTO guild_space (guild_id, space_id, privacy_level) VALUES (?, ?, ?)").run(guildID, spaceID, 0)
+	passthroughDiscord.guilds.set(guildID, {id: guildID, name: "Sound space"})
+	// @ts-ignore
+	api.sendState = async (...args) => { sent.push(args) }
+	// Existing pack has one sound in it
+	// @ts-ignore
+	api.getStateEvent = async () => ({pack: {display_name: "Sound space (Discord Sounds)"}, sounds: {boop: {url: "mxc://cadence.moe/5", body: "boop", info: {mimetype: "audio/mpeg"}}}})
+	try {
+		// @ts-ignore
+		await syncSpaceExpressions({guild_id: guildID, soundboard_sounds: []}, true)
+		t.deepEqual(sent, [[spaceID, "moe.crafty.room_soundboard", "moe.crafty.zdmb.pack.sounds", {pack: {display_name: "Sound space (Discord Sounds)"}, sounds: {}}]])
+	} finally {
+		api.sendState = realSendState
+		api.getStateEvent = realGetStateEvent
+		passthroughDiscord.guilds.delete(guildID)
+		db.prepare("DELETE FROM guild_space WHERE guild_id = ?").run(guildID)
+		db.prepare("DELETE FROM guild_active WHERE guild_id = ?").run(guildID)
+	}
+})
+
+test("syncSpaceExpressions: an empty soundboard list does nothing when no pack exists yet", async t => {
+	const guildID = "999000000000000005"
+	const spaceID = "!soundspace3:cadence.moe"
+	const passthroughDiscord = require("../../passthrough").discord
+	const realSendState = api.sendState
+	const realGetStateEvent = api.getStateEvent
+	/** @type {any[][]} */
+	const sent = []
+	db.prepare("INSERT INTO guild_active (guild_id, autocreate) VALUES (?, 1)").run(guildID)
+	db.prepare("INSERT INTO guild_space (guild_id, space_id, privacy_level) VALUES (?, ?, ?)").run(guildID, spaceID, 0)
+	passthroughDiscord.guilds.set(guildID, {id: guildID, name: "Sound space"})
+	// @ts-ignore
+	api.sendState = async (...args) => { sent.push(args) }
+	// @ts-ignore
+	api.getStateEvent = async () => { throw new mreq.MatrixServerError({errcode: "M_NOT_FOUND"}, 404) }
+	try {
+		// @ts-ignore
+		await syncSpaceExpressions({guild_id: guildID, soundboard_sounds: []}, true)
+		t.deepEqual(sent, [])
+	} finally {
+		api.sendState = realSendState
+		api.getStateEvent = realGetStateEvent
+		passthroughDiscord.guilds.delete(guildID)
+		db.prepare("DELETE FROM guild_space WHERE guild_id = ?").run(guildID)
+		db.prepare("DELETE FROM guild_active WHERE guild_id = ?").run(guildID)
+	}
 })

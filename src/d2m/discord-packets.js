@@ -150,6 +150,27 @@ async function onPacket(client, message, listen) {
 			guild.stickers = message.d.stickers
 		}
 
+	} else if (message.t === "GUILD_SOUNDBOARD_SOUND_CREATE" || message.t === "GUILD_SOUNDBOARD_SOUND_UPDATE") {
+		const guild = client.guilds.get(message.d.guild_id)
+		// Only update if the full list is known. Adding to a missing list would make it look like the only sound.
+		if (guild?.soundboard_sounds) {
+			const i = guild.soundboard_sounds.findIndex(s => s.sound_id === message.d.sound_id)
+			if (i === -1) guild.soundboard_sounds.push(message.d)
+			else guild.soundboard_sounds.splice(i, 1, message.d)
+		}
+
+	} else if (message.t === "GUILD_SOUNDBOARD_SOUND_DELETE") {
+		const guild = client.guilds.get(message.d.guild_id)
+		if (guild?.soundboard_sounds) {
+			guild.soundboard_sounds = guild.soundboard_sounds.filter(s => s.sound_id !== message.d.sound_id)
+		}
+
+	} else if (message.t === "GUILD_SOUNDBOARD_SOUNDS_UPDATE") {
+		const guild = client.guilds.get(message.d.guild_id)
+		if (guild) {
+			guild.soundboard_sounds = message.d.soundboard_sounds
+		}
+
 	} else if (message.t === "GUILD_ROLE_CREATE" || message.t === "GUILD_ROLE_UPDATE" || message.t === "GUILD_ROLE_DELETE") {
 		const guild = client.guilds.get(message.d.guild_id)
 		/** Delete this in case of UPDATE or DELETE */

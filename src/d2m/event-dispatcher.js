@@ -47,6 +47,17 @@ const voiceState = sync.require("./actions/voice-state")
 const {Semaphore} = require("@chriscdn/promise-semaphore")
 const checkMissedPinsSema = sync.remember(() => new Semaphore())
 
+/**
+ * Re-sync the soundboard pack from the cached guild's full sound list (kept up to date by discord-packets).
+ * @param {import("./discord-client")} client
+ * @param {string} guildID
+ */
+async function syncSoundboard(client, guildID) {
+	const guild = client.guilds.get(guildID)
+	if (!guild?.soundboard_sounds) return // list unknown, so syncing would wrongly look like every sound was deleted
+	await createSpace.syncSpaceExpressions({guild_id: guildID, soundboard_sounds: guild.soundboard_sounds}, false)
+}
+
 // Grab Discord events we care about for the bridge, check them, and pass them on
 
 module.exports = {
@@ -452,6 +463,38 @@ module.exports = {
 	 */
 	async GUILD_STICKERS_UPDATE(client, data) {
 		await createSpace.syncSpaceExpressions(data, false)
+	},
+
+	/**
+	 * @param {import("./discord-client")} client
+	 * @param {DiscordTypes.GatewayGuildSoundboardSoundCreateDispatchData} data
+	 */
+	async GUILD_SOUNDBOARD_SOUND_CREATE(client, data) {
+		await syncSoundboard(client, data.guild_id)
+	},
+
+	/**
+	 * @param {import("./discord-client")} client
+	 * @param {DiscordTypes.GatewayGuildSoundboardSoundUpdateDispatchData} data
+	 */
+	async GUILD_SOUNDBOARD_SOUND_UPDATE(client, data) {
+		await syncSoundboard(client, data.guild_id)
+	},
+
+	/**
+	 * @param {import("./discord-client")} client
+	 * @param {DiscordTypes.GatewayGuildSoundboardSoundDeleteDispatchData} data
+	 */
+	async GUILD_SOUNDBOARD_SOUND_DELETE(client, data) {
+		await syncSoundboard(client, data.guild_id)
+	},
+
+	/**
+	 * @param {import("./discord-client")} client
+	 * @param {DiscordTypes.GatewayGuildSoundboardSoundsUpdateDispatchData} data
+	 */
+	async GUILD_SOUNDBOARD_SOUNDS_UPDATE(client, data) {
+		await syncSoundboard(client, data.guild_id)
 	},
 
 	/**

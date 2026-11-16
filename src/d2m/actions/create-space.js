@@ -216,7 +216,7 @@ async function syncSpaceFully(guildID) {
 }
 
 /**
- * @param {DiscordTypes.GatewayGuildEmojisUpdateDispatchData | DiscordTypes.GatewayGuildStickersUpdateDispatchData} data
+ * @param {Partial<DiscordTypes.GatewayGuildEmojisUpdateDispatchData & DiscordTypes.GatewayGuildStickersUpdateDispatchData & DiscordTypes.GatewayGuildSoundboardSoundsUpdateDispatchData>} data
  * @param {boolean} checkBeforeSync false to always send new state, true to check the current state and only apply if state would change
  */
 async function syncSpaceExpressions(data, checkBeforeSync) {
@@ -226,36 +226,40 @@ async function syncSpaceExpressions(data, checkBeforeSync) {
 	if (!spaceID) return
 
 	/**
-	 * @typedef {DiscordTypes.GatewayGuildEmojisUpdateDispatchData & DiscordTypes.GatewayGuildStickersUpdateDispatchData} Expressions
 	 * @param {string} spaceID
-	 * @param {Expressions extends any ? keyof Expressions : never} key
+	 * @param {"emojis" | "stickers" | "soundboard_sounds"} key
+	 * @param {string} eventType
 	 * @param {string} eventKey
-	 * @param {typeof expression["emojisToState"] | typeof expression["stickersToState"]} fn
+	 * @param {(items: any[], guild: DiscordTypes.APIGuild) => any} fn
+	 * @param {boolean} clearWhenEmpty true if an empty list should still update the pack (so deleting the last item clears it)
 	 */
-	async function update(spaceID, key, eventKey, fn) {
-		if (!(key in data) || !data[key].length) return
+	async function update(spaceID, key, eventType, eventKey, fn, clearWhenEmpty) {
+		if (!(key in data)) return
+		const items = data[key]
+		if (!items || (!items.length && !clearWhenEmpty)) return
 		const guild = discord.guilds.get(data.guild_id)
 		assert(guild)
-		const content = await fn(data[key], guild)
+		const content = await fn(items, guild)
 		if (checkBeforeSync) {
 			let existing
 			try {
-				existing = await api.getStateEvent(spaceID, "im.ponies.room_emotes", eventKey)
+				existing = await api.getStateEvent(spaceID, eventType, eventKey)
 			} catch (e) {
 				if (e instanceof mreq.MatrixServerError && e.httpStatus < 500) {
 					// State event not found. This space doesn't have any existing emojis. We create a dummy empty event for comparison's sake.
-					existing = fn([], guild)
+					existing = await fn([], guild)
 				} else {
 					throw e
 				}
 			}
 			if (isDeepStrictEqual(existing, content)) return
 		}
-		await api.sendState(spaceID, "im.ponies.room_emotes", eventKey, content)
+		await api.sendState(spaceID, eventType, eventKey, content)
 	}
 
-	await update(spaceID, "emojis", "moe.cadence.ooye.pack.emojis", expression.emojisToState)
-	await update(spaceID, "stickers", "moe.cadence.ooye.pack.stickers", expression.stickersToState)
+	await update(spaceID, "emojis", "im.ponies.room_emotes", "moe.cadence.ooye.pack.emojis", expression.emojisToState, false)
+	await update(spaceID, "stickers", "im.ponies.room_emotes", "moe.cadence.ooye.pack.stickers", expression.stickersToState, false)
+	await update(spaceID, "soundboard_sounds", "moe.crafty.room_soundboard", "moe.crafty.zdmb.pack.sounds", expression.soundsToState, true)
 }
 
 module.exports.createSpace = createSpace
