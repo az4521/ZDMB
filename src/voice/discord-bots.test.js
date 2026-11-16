@@ -291,3 +291,36 @@ test("botpool onMainBotPacket: forwards main voice packets to the main bot adapt
 	t.equal(seen.length, 1)
 	t.equal(seen[0].user_id, "100")
 })
+
+test("voicebot sendSoundboardSound: posts to the channel with the sound and its source guild", async t => {
+	/** @type {any[]} */
+	const requests = []
+	const snow = {
+		guild: {editSelf: () => Promise.resolve({})},
+		requestHandler: {
+			request(/** @type {string} */ endpoint, /** @type {any} */ params, /** @type {string} */ method, /** @type {string} */ dataType, /** @type {any} */ data) {
+				requests.push({endpoint, params, method, dataType, data})
+				return Promise.resolve({})
+			},
+		},
+	}
+	const bot = new VoiceBot({userID: "200", isMain: false, cloud: fakeCloud(), snow: /** @type {any} */ (snow), voiceLib: () => /** @type {any} */ ({})})
+	await bot.sendSoundboardSound("900", "111", "800")
+	await bot.sendSoundboardSound("900", "1")
+	t.deepEqual(requests, [
+		{endpoint: "/channels/900/send-soundboard-sound", params: undefined, method: "post", dataType: "json", data: {sound_id: "111", source_guild_id: "800"}},
+		{endpoint: "/channels/900/send-soundboard-sound", params: undefined, method: "post", dataType: "json", data: {sound_id: "1"}},
+	], "the source guild is only sent when known")
+	t.end()
+})
+
+test("voicebot sendSoundboardSound: Discord refusing the request rejects the call", async t => {
+	const snow = {
+		guild: {editSelf: () => Promise.resolve({})},
+		requestHandler: {request: () => Promise.reject(new Error("Missing Permissions"))},
+	}
+	const bot = new VoiceBot({userID: "200", isMain: false, cloud: fakeCloud(), snow: /** @type {any} */ (snow), voiceLib: () => /** @type {any} */ ({})})
+	const error = await bot.sendSoundboardSound("900", "111", null).catch(e => e)
+	t.equal(error.message, "Missing Permissions")
+	t.end()
+})

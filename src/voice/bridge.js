@@ -20,6 +20,7 @@ const passthrough = require("../passthrough")
 const audio = require("./audio")
 const livekit = require("./livekit")
 const discordBots = require("./discord-bots")
+const soundboard = require("./soundboard")
 
 /** Discord channel types that can be bridged: GuildVoice and GuildStageVoice */
 const VOICE_CHANNEL_TYPES = new Set([2, 13])
@@ -31,6 +32,18 @@ const MONO_FRAME_SAMPLES = 960
 const PARTICIPANT_BUFFER = {maxMs: 200, primeMs: 40}
 /** Discord nickname length limit */
 const MAX_NICK_LENGTH = 32
+/** Sounds from one Matrix sender closer together than this are dropped, as Zam does */
+const SOUND_MIN_GAP_MS = 250
+/** At most this many sounds from one Matrix sender play at once, as Zam does */
+const SOUND_MAX_CONCURRENT = 3
+/** Assumed length of a native Discord soundboard sound (Discord caps them at 5 s), for the concurrency limit */
+const NATIVE_SOUND_MS = 5000
+/** Decoded sounds, by mxc URL */
+const soundCache = new soundboard.LruCache(16)
+/** Set after ffmpeg is found to be missing, so that it is reported once and Matrix sounds are then skipped */
+let ffmpegMissing = false
+/** Discord soundboard sounds being bridged, so that _idle() can wait for them */
+const pendingDiscordSounds = new Set()
 
 /**
  * Collaborators. Replace entries in tests. Each one is resolved when it is first used, so that loading this module
@@ -72,6 +85,12 @@ const _deps = {
 	bridgedChannelRows: () => passthrough.select("channel_room", ["channel_id", "room_id"]).all(),
 	/** @type {(userID: string) => string | null} */
 	simMxid: userID => passthrough.select("sim", "mxid", {user_id: userID}).pluck().get() ?? null,
+	/** @type {() => any} */
+	file: () => passthrough.sync.require("../matrix/file"),
+	/** @type {(mxc: string) => string[]} */
+	discordURLsForMxc: mxc => passthrough.select("file", "discord_url", {mxc_url: mxc}).pluck().all(),
+	/** @type {(buffer: Buffer) => Promise<Int16Array>} */
+	decodeToPcm: buffer => soundboard.decodeToPcm(buffer),
 }
 
 /**
@@ -84,6 +103,7 @@ const _deps = {
  * @property {any} bot dedicated puppet, if any
  * @property {any} player
  * @property {import("./audio").LivePcmStream | null} stream
+ * @property {import("./soundboard").SoundClips} clips sounds playing on top of this participant's audio
  */
 
 /**
@@ -165,6 +185,74 @@ function playStream(connection, stream) {
 	return player
 }
 
+/**
+ * One mono frame of a Matrix participant: their voice, with any sound clips mixed on top.
+ * @param {Participant} participant
+ * @returns {Int16Array}
+ */
+function participantFrame(participant) {
+	const voice = participant.buffer.read(MONO_FRAME_SAMPLES)
+	const clip = participant.clips.read(MONO_FRAME_SAMPLES)
+	return clip ? audio.mixMono([voice, clip], MONO_FRAME_SAMPLES) : voice
+}
+
+/**
+ * @param {string} mxc
+ * @returns {string | null} the Discord soundboard sound ID if this mxc is a sound we uploaded from Discord
+ */
+function discordSoundIDForMxc(mxc) {
+	for (const url of _deps.discordURLsForMxc(mxc)) {
+		const match = soundboard.DISCORD_SOUND_URL.exec(url)
+		if (match) return match[1]
+	}
+	return null
+}
+
+/**
+ * @param {string} soundID
+ * @returns {string | null} the cached guild that owns this Discord soundboard sound, or null if none does
+ */
+function guildIDForSound(soundID) {
+	for (const [guildID, guild] of _deps.discord().guilds) {
+		if (guild.soundboard_sounds?.some((/** @type {{sound_id: string}} */ sound) => String(sound.sound_id) === soundID)) return guildID
+	}
+	return null
+}
+
+/**
+ * Downloads a Matrix sound and decodes it to 48 kHz mono PCM. Cached by mxc URL.
+ * @param {string} mxc
+ * @returns {Promise<Int16Array | null>} null when ffmpeg is missing, so the sound is skipped
+ */
+async function loadSoundPcm(mxc) {
+	const cached = soundCache.get(mxc)
+	if (cached) return cached
+	if (ffmpegMissing) return null
+
+	const response = await _deps.api().getMedia(mxc)
+	if (!response.ok) throw new Error(`could not download ${mxc}: HTTP ${response.status}`)
+	const declared = Number(response.headers.get("content-length") ?? 0)
+	if (declared > soundboard.MAX_SOUND_BYTES) throw new Error(`${mxc} is ${declared} bytes, over the ${soundboard.MAX_SOUND_BYTES} byte limit`)
+	const buffer = Buffer.from(await response.arrayBuffer())
+	if (buffer.length > soundboard.MAX_SOUND_BYTES) throw new Error(`${mxc} is ${buffer.length} bytes, over the ${soundboard.MAX_SOUND_BYTES} byte limit`)
+
+	let samples
+	try {
+		samples = await _deps.decodeToPcm(buffer)
+	} catch (e) {
+		if (e?.code === "FFMPEG_NOT_FOUND") {
+			if (!ffmpegMissing) {
+				ffmpegMissing = true
+				console.error("[voice] soundboard sounds from Matrix can't be mixed in without ffmpeg, so they are skipped:", e.message)
+			}
+			return null
+		}
+		throw e
+	}
+	soundCache.set(mxc, samples)
+	return samples
+}
+
 class ChannelBridge {
 	/**
 	 * @param {{guildID: string, channelID: string, roomID: string}} ids
@@ -205,6 +293,10 @@ class ChannelBridge {
 		this.onStart = null
 		/** @type {any} the LiveKit listener */
 		this.listener = null
+		/** @type {import("./soundboard").SoundClips} sounds from senders that have no track of their own, mixed into the anchor's output */
+		this.soundClips = new soundboard.SoundClips()
+		/** @type {Map<string, {lastAt: number, slots: {endsAt: number}[]}>} LiveKit identity to that sender's recent sounds */
+		this.soundSenders = new Map()
 	}
 
 	/**
@@ -354,6 +446,9 @@ class ChannelBridge {
 			listener.on("trackEnd", (/** @type {string} */ identity) => {
 				if (this.listener === listener) this.onTrackEnd(identity)
 			})
+			listener.on("soundboard", (/** @type {string} */ identity, /** @type {{url: string, shortcode: string}} */ sound) => {
+				if (this.listener === listener) this.onSoundboard(identity, sound)
+			})
 			listener.on("disconnected", (/** @type {any} */ reason) => {
 				console.error(`[voice] listener for ${this.roomID} disconnected:`, reason)
 			})
@@ -373,6 +468,7 @@ class ChannelBridge {
 		const {anchor, connection, onStart, anchorPlayer, anchorStream, listener} = this
 		this.active = false
 		this.anchor = null
+		this.soundClips.clear()
 		this.connection = null
 		this.onStart = null
 		this.anchorPlayer = null
@@ -521,6 +617,7 @@ class ChannelBridge {
 			bot: null,
 			player: null,
 			stream: null,
+			clips: new soundboard.SoundClips(),
 		}
 		this.participants.set(identity, participant)
 		this.track(this.attachParticipant(participant))
@@ -545,7 +642,7 @@ class ChannelBridge {
 			}
 			participant.joining = false
 			if (connection && !participant.ended) {
-				const stream = new audio.LivePcmStream(() => audio.monoToStereo(participant.buffer.read(MONO_FRAME_SAMPLES)))
+				const stream = new audio.LivePcmStream(() => audio.monoToStereo(participantFrame(participant)))
 				participant.stream = stream
 				participant.player = playStream(connection, stream)
 				return
@@ -604,6 +701,7 @@ class ChannelBridge {
 		try { participant.player?.stop() } catch (e) {}
 		participant.stream = null
 		participant.player = null
+		participant.clips.clear()
 		// While the puppet is still joining, attachParticipant gives it back once the join finishes
 		if (participant.bot && !participant.joining) {
 			const bot = participant.bot
@@ -622,12 +720,97 @@ class ChannelBridge {
 	}
 
 	/**
-	 * Mixes the overflow participants for the anchor's output.
-	 * @returns {Buffer | null} one stereo frame, or null for silence when nobody is overflowing
+	 * A soundboard packet from a Matrix participant's LiveKit identity. Discord sounds are played natively when possible,
+	 * and anything else is decoded and mixed in. Never throws.
+	 * @param {string} identity
+	 * @param {{url: string, shortcode: string}} sound
+	 */
+	onSoundboard(identity, sound) {
+		try {
+			if (!this.active) return
+			const slot = this.reserveSoundSlot(identity, Date.now())
+			if (slot) this.track(this.playMatrixSound(identity, sound, slot))
+		} catch (e) {
+			console.error(`[voice] failed to handle a soundboard sound in ${this.channelID}:`, e)
+		}
+	}
+
+	/**
+	 * Applies the per-sender limits. A sound less than 250 ms after the sender's previous one is dropped, and so is one
+	 * that would be a fourth playing at once.
+	 * @param {string} identity
+	 * @param {number} now
+	 * @returns {{endsAt: number} | null} a slot to record when the sound stops, or null to drop the sound
+	 */
+	reserveSoundSlot(identity, now) {
+		let sender = this.soundSenders.get(identity)
+		if (!sender) {
+			sender = {lastAt: -Infinity, slots: []}
+			this.soundSenders.set(identity, sender)
+		}
+		if (now - sender.lastAt < SOUND_MIN_GAP_MS) return null
+		sender.slots = sender.slots.filter(slot => slot.endsAt > now)
+		if (sender.slots.length >= SOUND_MAX_CONCURRENT) return null
+		sender.lastAt = now
+		const slot = {endsAt: Infinity}
+		sender.slots.push(slot)
+		return slot
+	}
+
+	/**
+	 * @param {string} identity
+	 * @param {{url: string, shortcode: string}} sound
+	 * @param {{endsAt: number}} slot
+	 */
+	async playMatrixSound(identity, sound, slot) {
+		/** @type {number} */
+		let endsAt = 0
+		try {
+			endsAt = await this.startMatrixSound(identity, sound)
+		} catch (e) {
+			console.error(`[voice] could not play soundboard sound ${sound.url} in ${this.channelID}:`, e)
+		} finally {
+			slot.endsAt = endsAt
+		}
+	}
+
+	/**
+	 * @param {string} identity
+	 * @param {{url: string, shortcode: string}} sound
+	 * @returns {Promise<number>} when the sound is expected to stop (ms since the epoch), or 0 if nothing is playing
+	 */
+	async startMatrixSound(identity, sound) {
+		const owner = this.participants.get(identity)
+		const discordSoundID = discordSoundIDForMxc(sound.url)
+		if (discordSoundID && this.anchor) {
+			// Play it as the sender's own puppet if they have one that is in the channel, so that Discord shows it from them
+			const bot = owner && owner.bot && !owner.joining ? owner.bot : this.anchor
+			try {
+				await bot.sendSoundboardSound(this.channelID, discordSoundID, guildIDForSound(discordSoundID))
+				return Date.now() + NATIVE_SOUND_MS
+			} catch (e) {
+				console.error(`[voice] Discord would not play sound ${discordSoundID} in ${this.channelID}, so it is mixed in instead:`, e)
+			}
+		}
+
+		const samples = await loadSoundPcm(sound.url)
+		if (!samples || !this.active) return 0
+		// Look the participant up again, since they may have left while the sound was downloading
+		const current = this.participants.get(identity)
+		const target = current && !current.ended ? current.clips : this.soundClips
+		target.add(samples)
+		return Date.now() + samples.length * 1000 / soundboard.SAMPLE_RATE
+	}
+
+	/**
+	 * Mixes the overflow participants, and any loose sound clips, for the anchor's output.
+	 * @returns {Buffer | null} one stereo frame, or null for silence when nothing is playing
 	 */
 	pullOverflow() {
-		if (this.overflow.size === 0) return null
-		const frames = [...this.overflow.values()].map(participant => participant.buffer.read(MONO_FRAME_SAMPLES))
+		const frames = [...this.overflow.values()].map(participantFrame)
+		const loose = this.soundClips.read(MONO_FRAME_SAMPLES)
+		if (loose) frames.push(loose)
+		if (frames.length === 0) return null
 		return audio.monoToStereo(audio.mixMono(frames, MONO_FRAME_SAMPLES))
 	}
 }
@@ -698,6 +881,45 @@ function handleMatrixCallMember(event) {
 	const guildID = _deps.discord().channels.get(channelID).guild_id
 	const inCall = rtc.parseCallMembers([event]).some((/** @type {{mxid: string}} */ m) => m.mxid === sender)
 	getOrCreateBridge(guildID, channelID, roomID).setMatrixHuman(sender, inCall)
+}
+
+/**
+ * Plays or mixes a soundboard sound that was played in a bridged Discord channel. Only Discord sounds we can give an mxc are sent.
+ * @param {any} data a VOICE_CHANNEL_EFFECT_SEND payload
+ */
+async function handleDiscordSoundboard(data) {
+	if (!data.sound_id) return // an emoji-only effect
+	const soundID = String(data.sound_id)
+	const bridge = channelBridges.get(bridgeKey(data.guild_id, data.channel_id))
+	if (!bridge || !bridge.active || !bridge.listener) return
+
+	// Same shortcode as in the guild's synced sound pack (including the _2 suffixes for duplicate names)
+	const guildSounds = _deps.discord().guilds.get(data.guild_id)?.soundboard_sounds ?? []
+	const planned = require("../d2m/actions/expression").planSoundShortcodes(guildSounds).find(p => String(p.sound.sound_id) === soundID)
+	const shortcode = planned ? planned.shortcode : soundboard.shortcodeForName("sound")
+	const url = `https://cdn.discordapp.com/soundboard-sounds/${soundID}`
+	const mxc = await _deps.file().uploadDiscordFileToMxc(url)
+	const bytes = soundboard.encodeSoundboardPacket({url: mxc, shortcode})
+
+	// Zam attributes the sound to whoever sends it, so send it from the speaker's own publisher when they have one
+	const entry = bridge.publishers.get(String(data.user_id))
+	const sender = entry && entry.publisher.connected ? entry.publisher : bridge.listener
+	await sender.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC, reliable: true})
+}
+
+/**
+ * Hook for VOICE_CHANNEL_EFFECT_SEND from the main bot. Only effects with a sound are bridged. Never throws.
+ * @param {any} data the gateway payload: guild_id, channel_id, user_id, sound_id, sound_volume, emoji
+ */
+function onDiscordSoundboard(data) {
+	if (!started) return
+	try {
+		const work = handleDiscordSoundboard(data).catch(e => console.error("[voice] failed to bridge a soundboard sound from Discord:", e))
+		pendingDiscordSounds.add(work)
+		work.then(() => pendingDiscordSounds.delete(work))
+	} catch (e) {
+		console.error("[voice] failed to handle a soundboard sound from Discord:", e)
+	}
 }
 
 /**
@@ -818,6 +1040,7 @@ async function stop() {
  * Waits for all queued channel work. Intended for tests.
  */
 async function _idle() {
+	while (pendingDiscordSounds.size > 0) await Promise.all([...pendingDiscordSounds])
 	await Promise.all([...channelBridges.values()].map(bridge => bridge.idle()))
 }
 
@@ -826,9 +1049,14 @@ module.exports = {
 	stop,
 	onDiscordVoiceState,
 	onMatrixCallMemberEvent,
+	onDiscordSoundboard,
 	ChannelBridge,
 	_channelBridges: channelBridges,
 	_deps,
 	_idle,
 	_sweepMatrixMembers: sweepMatrixMembers,
+	_resetSoundState() {
+		soundCache.clear()
+		ffmpegMissing = false
+	},
 }

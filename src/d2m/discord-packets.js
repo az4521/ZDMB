@@ -242,10 +242,11 @@ async function onPacket(client, message, listen) {
 	}
 
 	// Voice bridge: the main bot's voice packets are handled here in real time, before any queueing, because VOICE_SERVER_UPDATE can't be replayed later
-	if (reg.ooye.voice_bridge && (message.t === "VOICE_STATE_UPDATE" || message.t === "VOICE_SERVER_UPDATE")) {
+	if (reg.ooye.voice_bridge && (message.t === "VOICE_STATE_UPDATE" || message.t === "VOICE_SERVER_UPDATE" || message.t === "VOICE_CHANNEL_EFFECT_SEND")) {
 		try {
 			require("../voice/discord-bots").onMainBotPacket(message)
 			if (message.t === "VOICE_STATE_UPDATE") require("../voice/bridge").onDiscordVoiceState(message.d)
+			if (message.t === "VOICE_CHANNEL_EFFECT_SEND") require("../voice/bridge").onDiscordSoundboard(message.d)
 		} catch (e) {
 			console.error("[voice] failed to route a voice packet:", e)
 		}

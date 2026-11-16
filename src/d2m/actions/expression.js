@@ -102,6 +102,22 @@ function soundShortcode(name, taken) {
 }
 
 /**
+ * The shortcode each available sound gets in the guild's sound pack. Also used by the voice bridge, so that a
+ * sound played live has the same shortcode as in the pack.
+ * Sorted by sound ID so that shortcodes don't shuffle between syncs, and assigned up front so that a failed upload
+ * doesn't change any other sound's shortcode.
+ * @param {DiscordTypes.APISoundboardSound[]} sounds
+ * @returns {{sound: DiscordTypes.APISoundboardSound, shortcode: string}[]}
+ */
+function planSoundShortcodes(sounds) {
+	const available = sounds
+		.filter(sound => sound.available !== false)
+		.sort((a, b) => BigInt(a.sound_id) < BigInt(b.sound_id) ? -1 : BigInt(a.sound_id) > BigInt(b.sound_id) ? 1 : 0)
+	const taken = new Set()
+	return available.map(sound => ({sound, shortcode: soundShortcode(sound.name, taken)}))
+}
+
+/**
  * @param {DiscordTypes.APISoundboardSound[]} sounds
  * @param {DiscordTypes.APIGuild} guild
  */
@@ -112,13 +128,7 @@ async function soundsToState(sounds, guild) {
 		},
 		sounds: {}
 	}
-	// Stable order so that shortcodes don't shuffle between syncs
-	const available = sounds
-		.filter(sound => sound.available !== false)
-		.sort((a, b) => BigInt(a.sound_id) < BigInt(b.sound_id) ? -1 : BigInt(a.sound_id) > BigInt(b.sound_id) ? 1 : 0)
-	const taken = new Set()
-	// Shortcodes are assigned up front in sorted order, so a failed upload doesn't change any other sound's shortcode
-	const planned = available.map(sound => ({sound, shortcode: soundShortcode(sound.name, taken)}))
+	const planned = planSoundShortcodes(sounds)
 	const uploaded = await Promise.all(planned.map(({sound, shortcode}) =>
 		file.uploadDiscordFileToMxc(`https://cdn.discordapp.com/soundboard-sounds/${sound.sound_id}`).then(url => ({
 			shortcode,
@@ -151,3 +161,4 @@ async function soundsToState(sounds, guild) {
 module.exports.emojisToState = emojisToState
 module.exports.stickersToState = stickersToState
 module.exports.soundsToState = soundsToState
+module.exports.planSoundShortcodes = planSoundShortcodes

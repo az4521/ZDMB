@@ -60,6 +60,8 @@ function fakeBot(userID, isMain) {
 		joins: [],
 		nicks: /** @type {(string | null)[]} */ ([]),
 		failJoin: false,
+		soundFailure: false,
+		sounds: /** @type {{channelID: string, soundID: string, sourceGuildID: string | null}[]} */ ([]),
 		async join(/** @type {string} */ guildID, /** @type {string} */ channelID) {
 			if (this.failJoin) throw new Error("join failed")
 			const connection = fakeConnection()
@@ -70,6 +72,15 @@ function fakeBot(userID, isMain) {
 			this.nicks.push(nick)
 		},
 		leave() {},
+		/**
+		 * @param {string} channelID
+		 * @param {string} soundID
+		 * @param {string | null} [sourceGuildID]
+		 */
+		async sendSoundboardSound(channelID, soundID, sourceGuildID = null) {
+			if (this.soundFailure) throw new Error("Missing Permissions")
+			this.sounds.push({channelID, soundID, sourceGuildID})
+		},
 	}
 }
 
@@ -78,6 +89,7 @@ function fakeBot(userID, isMain) {
  * @param {{voiceBridge?: boolean, puppets?: any[], callMembers?: any[], rooms?: Map<string, string>}} [options]
  */
 function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = new Map([[CHANNEL, ROOM]])} = {}) {
+	bridge._resetSoundState()
 	const main = fakeBot(BOT_MAIN, true)
 	const allocated = new Set()
 	const pool = {
@@ -125,6 +137,7 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 			this.closed = false
 			/** @type {any[]} */
 			this.frames = []
+			this.dataPackets = /** @type {{bytes: any, opts: any}[]} */ ([])
 			publishers.push(this)
 		}
 		async connect() {
@@ -133,6 +146,11 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		/** @param {any} samples */
 		pushMono(samples) {
 			this.frames.push(samples)
+		}
+		/** @param {any} bytes @param {any} opts */
+		async publishData(bytes, opts) {
+			this.dataPackets.push({bytes, opts})
+			return true
 		}
 		async close() {
 			this.closed = true
@@ -145,6 +163,7 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		constructor(options) {
 			super()
 			this.options = options
+			this.dataPackets = /** @type {{bytes: any, opts: any}[]} */ ([])
 			this.connected = false
 			this.closed = false
 			listeners.push(this)
@@ -154,6 +173,11 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		}
 		async close() {
 			this.closed = true
+		}
+		/** @param {any} bytes @param {any} opts */
+		async publishData(bytes, opts) {
+			this.dataPackets.push({bytes, opts})
+			return true
 		}
 	}
 
@@ -221,7 +245,11 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 			[STAGE, {id: STAGE, type: 13, guild_id: GUILD}],
 			["950", {id: "950", type: 0, guild_id: GUILD}],
 		]),
-		guilds: new Map([[GUILD, {id: GUILD, voice_states: []}]]),
+		guilds: new Map([[GUILD, {
+			id: GUILD,
+			voice_states: [],
+			soundboard_sounds: [{sound_id: "111", name: "Air Horn"}],
+		}]]),
 	}
 
 	const rtc = {
@@ -233,6 +261,30 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		getLiveKitCredentials: async (/** @type {string} */ mxid) => ({url: "wss://lk.example", jwt: `jwt:${mxid}`}),
 		getRoomCallMembers: async () => callMembers,
 		clearStaleOwnMemberships: async () => 0,
+	}
+
+	const media = {
+		/** @type {string[]} Discord URLs uploaded this test */
+		uploads: /** @type {string[]} */ ([]),
+		/** @type {string[]} mxc URLs downloaded this test */
+		downloads: /** @type {string[]} */ ([]),
+		/** @type {Map<string, string>} mxc URL to Discord URL, like the file table */
+		rows: new Map(),
+		decodes: 0,
+		decodeSeconds: 1,
+		declaredSize: 16,
+		noFfmpeg: false,
+	}
+	const fileFake = {
+		/** @param {string} url */
+		async uploadDiscordFileToMxc(url) {
+			const mxc = `mxc://cadence.moe/${url.split("/").pop()}`
+			if (!media.rows.has(mxc)) {
+				media.uploads.push(url)
+				media.rows.set(mxc, url)
+			}
+			return mxc
+		},
 	}
 
 	const deps = {
@@ -248,6 +300,11 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		registerUser: () => registerUser,
 		api: () => ({
 			getStateEvent: async () => ({displayname: "Alice Example"}),
+			/** @param {string} mxc */
+			getMedia: async mxc => {
+				media.downloads.push(mxc)
+				return new Response(Buffer.alloc(16, 1), {status: 200, headers: {"content-length": String(media.declaredSize)}})
+			},
 		}),
 		mxUtils: () => ({
 			bot: OURS_BOT,
@@ -260,6 +317,13 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		channelIDForRoom: (/** @type {string} */ roomID) => [...rooms].find(([, r]) => r === roomID)?.[0] ?? null,
 		bridgedChannelRows: () => [...rooms].map(([channel_id, room_id]) => ({channel_id, room_id})),
 		simMxid: () => null,
+		file: () => fileFake,
+		discordURLsForMxc: (/** @type {string} */ mxc) => media.rows.has(mxc) ? [/** @type {string} */ (media.rows.get(mxc))] : [],
+		decodeToPcm: async () => {
+			media.decodes++
+			if (media.noFfmpeg) throw Object.assign(new Error("ffmpeg was not found"), {code: "FFMPEG_NOT_FOUND"})
+			return new Int16Array(48000 * media.decodeSeconds).fill(500)
+		},
 	}
 
 	/** Installs the fakes and returns a function that puts the real collaborators back. */
@@ -267,7 +331,7 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 	Object.assign(bridge._deps, deps)
 	const restore = () => Object.assign(bridge._deps, saved)
 
-	return {pool, main, publishers, listeners, memberships, registerUser, voiceLib, restore}
+	return {pool, main, publishers, listeners, memberships, registerUser, voiceLib, restore, media}
 }
 
 /**
@@ -618,6 +682,329 @@ test("voice bridge: stop tears everything down and ignores later events", async 
 		t.equal(env.pool.acquired.length, 1, "no activation after stop")
 		t.end()
 	} finally {
+		env.restore()
+	}
+})
+
+const DISCORD_USER = "555"
+const MXC_AIRHORN = "mxc://cadence.moe/111"
+const DISCORD_AIRHORN = "https://cdn.discordapp.com/soundboard-sounds/111"
+const MXC_OTHER = "mxc://cadence.moe/otherfile"
+
+/**
+ * Runs fn with console.error collected rather than printed. Returns what was logged.
+ * @param {() => Promise<void>} fn
+ * @returns {Promise<any[][]>}
+ */
+async function quietErrors(fn) {
+	/** @type {any[][]} */
+	const logged = []
+	const saved = console.error
+	console.error = (...args) => { logged.push(args) }
+	try {
+		await fn()
+	} finally {
+		console.error = saved
+	}
+	return logged
+}
+
+/**
+ * Puts one Matrix human in the call with their track started. Returns the Listener that carries their audio.
+ * @param {any} env
+ * @param {string} mxid
+ */
+async function startMatrixSpeaker(env, mxid) {
+	bridge.onMatrixCallMemberEvent(callEvent(mxid, JOIN_CONTENT))
+	await bridge._idle()
+	const listener = env.listeners[0]
+	listener.emit("trackStart", `${mxid}:ZDMBVOICE`, mxid)
+	await bridge._idle()
+	return listener
+}
+
+test("voice bridge: a Discord soundboard sound is uploaded once and sent as a packet from the speaker's publisher", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+		const effect = {guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111", sound_volume: 1}
+		bridge.onDiscordSoundboard(effect)
+		bridge.onDiscordSoundboard(effect)
+		await bridge._idle()
+
+		t.deepEqual(env.media.uploads, [DISCORD_AIRHORN], "the sound is uploaded once")
+		const publisher = env.publishers[0]
+		t.equal(publisher.dataPackets.length, 2)
+		t.deepEqual(publisher.dataPackets[0].opts, {topic: "moe.crafty.soundboard", reliable: true})
+		t.equal(Buffer.from(publisher.dataPackets[0].bytes).toString(), `{"url":"${MXC_AIRHORN}","shortcode":"Air_Horn","v":1,"name":"Air_Horn"}`)
+		t.equal(env.listeners[0].dataPackets.length, 0, "the bridge bot sends nothing")
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Discord soundboard sound from someone without a publisher is sent from the bridge bot", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: "777", sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.listeners[0].dataPackets.length, 1)
+		t.equal(Buffer.from(env.listeners[0].dataPackets[0].bytes).toString(), `{"url":"${MXC_AIRHORN}","shortcode":"Air_Horn","v":1,"name":"Air_Horn"}`)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: Discord effects without a sound, and sounds in channels that are not active, are ignored", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.media.uploads.length, 0, "a channel with nobody in it is not active")
+
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, emoji: {name: "wave"}})
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: "950", user_id: DISCORD_USER, sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.media.uploads.length, 0, "emoji-only effects and text channels are ignored")
+		t.equal(env.listeners[0].dataPackets.length, 0)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix soundboard for a Discord sound is played natively by the speaker's puppet", async t => {
+	const puppet = fakeBot(BOT_PUPPET, false)
+	const env = makeEnv({puppets: [puppet]})
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		env.media.rows.set(MXC_AIRHORN, DISCORD_AIRHORN)
+		listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: MXC_AIRHORN, shortcode: "airhorn", name: "airhorn"})
+		await bridge._idle()
+
+		t.deepEqual(puppet.sounds, [{channelID: CHANNEL, soundID: "111", sourceGuildID: GUILD}])
+		t.equal(env.main.sounds.length, 0, "the anchor does not play it")
+		t.equal(env.media.downloads.length, 0, "nothing is downloaded when it is played natively")
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix soundboard for a Discord sound goes through the anchor when the speaker has no puppet", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		env.media.rows.set(MXC_AIRHORN, DISCORD_AIRHORN)
+		listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: MXC_AIRHORN, shortcode: "airhorn", name: "airhorn"})
+		await bridge._idle()
+		t.deepEqual(env.main.sounds, [{channelID: CHANNEL, soundID: "111", sourceGuildID: GUILD}])
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: when Discord refuses a native sound, it is downloaded and mixed into the speaker's puppet", async t => {
+	const puppet = fakeBot(BOT_PUPPET, false)
+	puppet.soundFailure = true
+	const env = makeEnv({puppets: [puppet]})
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		env.media.rows.set(MXC_AIRHORN, DISCORD_AIRHORN)
+		const logged = await quietErrors(async () => {
+			listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: MXC_AIRHORN, shortcode: "airhorn", name: "airhorn"})
+			await bridge._idle()
+		})
+		t.equal(logged.length, 1, "the refusal is logged")
+		t.equal(puppet.sounds.length, 0)
+		t.deepEqual(env.media.downloads, [MXC_AIRHORN])
+		t.equal(env.media.decodes, 1)
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		t.equal(cb.participants.get(`${ALICE}:ZDMBVOICE`).clips.active, true, "the sound plays on the puppet's stream")
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix sound that is not from Discord is downloaded, decoded and mixed into a silent speaker's output", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE) // Alice has no puppet, so she is in the overflow mix and silent
+		listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+		await bridge._idle()
+
+		t.deepEqual(env.media.downloads, [MXC_OTHER])
+		t.equal(env.media.decodes, 1)
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		const frame = cb.pullOverflow()
+		t.ok(frame)
+		t.equal(frame.length, 3840, "one stereo 20 ms frame")
+		t.equal(frame.readInt16LE(0), 500, "the sound is in the output even though nobody spoke")
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix sound from a sender with no track is mixed into the anchor's output", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		await bridge._idle()
+		listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+		await bridge._idle()
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		t.equal(cb.soundClips.active, true)
+		t.equal(cb.pullOverflow().readInt16LE(0), 500)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a downloaded sound is cached, so the same mxc is not downloaded again", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+		await bridge._idle()
+		listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+		await bridge._idle()
+		t.deepEqual(env.media.downloads, [MXC_OTHER])
+		t.equal(env.media.decodes, 1)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a sender's sounds closer than 250 ms apart are dropped, and other senders are not affected", async t => {
+	const env = makeEnv()
+	const realNow = Date.now
+	let now = 1_800_000_000_000
+	Date.now = () => now
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		const bobIdentity = `${BOB}:ZDMBVOICE`
+		listener.emit("soundboard", bobIdentity, {url: "mxc://cadence.moe/a", shortcode: "a", name: "a"})
+		await bridge._idle()
+		now += 100
+		listener.emit("soundboard", bobIdentity, {url: "mxc://cadence.moe/b", shortcode: "b", name: "b"})
+		await bridge._idle()
+		now += 200 // 300 ms after the first
+		listener.emit("soundboard", bobIdentity, {url: "mxc://cadence.moe/c", shortcode: "c", name: "c"})
+		await bridge._idle()
+		listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: "mxc://cadence.moe/d", shortcode: "d", name: "d"})
+		await bridge._idle()
+		t.deepEqual(env.media.downloads, ["mxc://cadence.moe/a", "mxc://cadence.moe/c", "mxc://cadence.moe/d"])
+	} finally {
+		Date.now = realNow
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: at most three sounds from one sender play at once", async t => {
+	const env = makeEnv()
+	env.media.decodeSeconds = 5
+	const realNow = Date.now
+	let now = 1_800_000_000_000
+	Date.now = () => now
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		const identity = `${BOB}:ZDMBVOICE`
+		for (let i = 0; i < 4; i++) {
+			listener.emit("soundboard", identity, {url: `mxc://cadence.moe/s${i}`, shortcode: "s", name: "s"})
+			await bridge._idle()
+			now += 300
+		}
+		t.deepEqual(env.media.downloads, ["mxc://cadence.moe/s0", "mxc://cadence.moe/s1", "mxc://cadence.moe/s2"], "the fourth is dropped")
+
+		now += 5000 // the first three have finished by now
+		listener.emit("soundboard", identity, {url: "mxc://cadence.moe/s4", shortcode: "s", name: "s"})
+		await bridge._idle()
+		t.equal(env.media.downloads.length, 4, "a slot is free again")
+	} finally {
+		Date.now = realNow
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: soundboard packets are ignored once the speaker has left and the channel is down", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, {}))
+		await bridge._idle()
+		listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+		await bridge._idle()
+		t.equal(env.media.downloads.length, 0)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: without ffmpeg the problem is logged once and later Matrix sounds are skipped", async t => {
+	const env = makeEnv()
+	env.media.noFfmpeg = true
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		const logged = await quietErrors(async () => {
+			listener.emit("soundboard", `${ALICE}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+			await bridge._idle()
+			listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: "mxc://cadence.moe/second", shortcode: "x", name: "x"})
+			await bridge._idle()
+		})
+		t.equal(logged.filter(args => String(args[0]).includes("ffmpeg")).length, 1, "logged once")
+		t.equal(env.media.downloads.length, 1, "the second sound is skipped before downloading")
+		t.equal(env.media.decodes, 1)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix sound over 1 MiB is refused without being decoded", async t => {
+	const env = makeEnv()
+	env.media.declaredSize = 2 * 1024 * 1024
+	try {
+		await bridge.start()
+		const listener = await startMatrixSpeaker(env, ALICE)
+		const logged = await quietErrors(async () => {
+			listener.emit("soundboard", `${BOB}:ZDMBVOICE`, {url: MXC_OTHER, shortcode: "wow", name: "wow"})
+			await bridge._idle()
+		})
+		t.equal(logged.length, 1)
+		t.equal(env.media.downloads.length, 1)
+		t.equal(env.media.decodes, 0)
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		t.equal(cb.soundClips.active, false)
+	} finally {
+		await bridge.stop()
 		env.restore()
 	}
 })

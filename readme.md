@@ -20,6 +20,7 @@ Rich presence, custom status and "in a call" follow the same per-server presence
 
 * **Media galleries.** A Discord message with two or more images, videos or files is bridged as one `dm.filament.gallery` message ([MSC4274](https://github.com/matrix-org/matrix-spec-proposals/pull/4274)) with the message text as its caption, and Matrix galleries are bridged to Discord as one message with several attachments (split into several messages above Discord's 10-attachment limit). Set `ooye.gallery_messages: false` in `registration.yaml` to keep OOYE's one-event-per-attachment behaviour for Discord-to-Matrix.
 * **Video thumbnails.** Videos bridged from Discord get a poster frame (`info.thumbnail_url`), taken from Discord's media proxy and scaled to fit 800×800.
+* **Soundboard packs.** Each server's custom soundboard sounds are synced to its space as a Zam sound pack (`moe.crafty.room_soundboard`, state key `moe.crafty.zdmb.pack.sounds`), so they show up in Zam's soundboard in that server's calls.
 * **Voice messages.** Discord voice messages become Matrix voice messages (MSC3245, with the waveform). Matrix voice messages go to Discord as `voice-message.ogg` audio files, because webhooks can't send real Discord voice messages.
 * **No PluralKit or /plu/ral support.** Messages from proxy bots are treated like any other webhook message.
 
@@ -42,6 +43,7 @@ Bridged voice channels can be bridged live to Matrix calls (MatrixRTC with a Liv
 * Each Discord speaker joins the Matrix call as their own bridged account, with their own audio track.
 * Matrix speakers are played into Discord by bots. Each Matrix speaker gets their own "puppet" bot (nicknamed after them) while there are free ones; anyone beyond that is mixed through the main bot.
 * A channel is bridged while anyone is in it on either side, and the bots leave when everyone has.
+* Soundboard sounds are bridged both ways (Zam's MSC4577 soundboard). Sounds played on Discord play for Zam users as coming from that person. Sounds played in Zam that came from a Discord server's soundboard play as real Discord soundboard sounds (needs the Use Soundboard permission, and Use External Sounds for other servers' sounds); any other sound is decoded with `ffmpeg` and mixed into that person's Discord audio.
 
 It's off by default. To turn it on, add to the `ooye` section of `registration.yaml`:
 

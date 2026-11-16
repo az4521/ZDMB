@@ -3,6 +3,7 @@
 const {EventEmitter} = require("events")
 const {test} = require("supertape")
 const {Publisher, Listener, Rechunker, mxidFromIdentity} = require("./livekit")
+const soundboard = require("./soundboard")
 
 // Fake @livekit/rtc-node. Constants mirror the real enum values. Nothing here touches the network.
 
@@ -10,6 +11,7 @@ const TrackSource = {SOURCE_UNKNOWN: 0, SOURCE_CAMERA: 1, SOURCE_MICROPHONE: 2, 
 const TrackKind = {KIND_UNKNOWN: 0, KIND_AUDIO: 1, KIND_VIDEO: 2}
 const RoomEvent = {
 	TrackSubscribed: "trackSubscribed",
+	DataReceived: "dataReceived",
 	TrackUnsubscribed: "trackUnsubscribed",
 	ParticipantDisconnected: "participantDisconnected",
 	Disconnected: "disconnected"
@@ -46,6 +48,9 @@ function makeFakeRtc() {
 			this.connectArgs = /** @type {any} */ (null)
 			this.disconnected = false
 			this.published = /** @type {any[]} */ ([])
+			/** @type {{data: any, opts: any}[]} */
+			this.dataPackets = []
+			this.failData = false
 			rooms.push(this)
 		}
 
@@ -55,6 +60,10 @@ function makeFakeRtc() {
 			this.localParticipant = {
 				publishTrack: async (/** @type {any} */ track, /** @type {any} */ opts) => {
 					this.published.push({track, opts})
+				},
+				publishData: async (/** @type {any} */ data, /** @type {any} */ opts) => {
+					if (this.failData) throw new Error("publish failed")
+					this.dataPackets.push({data, opts})
 				}
 			}
 		}
@@ -429,6 +438,96 @@ test("Listener: an unsubscribe for a different track does not end the current on
 	await flush()
 	t.deepEqual(ended, [])
 	t.equal(streams[0].cancelled, false)
+	await listener.close()
+	t.end()
+})
+
+const SOUND_URL = "mxc://cadence.moe/airhorn"
+
+test("Publisher: publishData sends a reliable packet with its topic, and is ignored before connect and after close", async t => {
+	const {rtc, rooms} = makeFakeRtc()
+	const publisher = new Publisher({url: "wss://lk.example", jwt: "jwt"}, {rtc})
+	const bytes = soundboard.encodeSoundboardPacket({url: SOUND_URL, shortcode: "airhorn"})
+	t.equal(await publisher.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC}), false, "not connected yet")
+	await publisher.connect()
+	t.equal(await publisher.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC}), true)
+	t.equal(rooms[0].dataPackets.length, 1)
+	t.equal(rooms[0].dataPackets[0].data, bytes)
+	t.deepEqual(rooms[0].dataPackets[0].opts, {reliable: true, topic: "moe.crafty.soundboard"})
+	await publisher.close()
+	t.equal(await publisher.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC}), false, "closed")
+	t.equal(rooms[0].dataPackets.length, 1)
+	t.end()
+})
+
+test("Publisher: a failed publishData is logged and reported as false, never thrown", async t => {
+	const {rtc, rooms} = makeFakeRtc()
+	const publisher = new Publisher({url: "wss://lk.example", jwt: "jwt"}, {rtc})
+	await publisher.connect()
+	rooms[0].failData = true
+	/** @type {any[][]} */
+	const logged = []
+	const savedError = console.error
+	console.error = (...args) => { logged.push(args) }
+	try {
+		t.equal(await publisher.publishData(new Uint8Array(3), {topic: "moe.crafty.soundboard"}), false)
+	} finally {
+		console.error = savedError
+	}
+	t.equal(logged.length, 1)
+	await publisher.close()
+	t.end()
+})
+
+test("Listener: publishData is ignored until connected, then sends from the bridge bot's identity", async t => {
+	const {rtc, rooms} = makeFakeRtc()
+	const listener = new Listener({url: "wss://lk.example", jwt: "jwt", isOurs: () => true}, {rtc})
+	const bytes = new Uint8Array([1, 2, 3])
+	t.equal(await listener.publishData(bytes, {topic: "moe.crafty.soundboard"}), false, "not connected yet")
+	await listener.connect()
+	t.equal(await listener.publishData(bytes, {topic: "moe.crafty.soundboard", reliable: false}), true)
+	t.deepEqual(rooms[0].dataPackets[0].opts, {reliable: false, topic: "moe.crafty.soundboard"})
+	await listener.close()
+	t.equal(await listener.publishData(bytes, {topic: "moe.crafty.soundboard"}), false, "closed")
+	t.end()
+})
+
+test("Listener: emits soundboard for a valid packet from someone who is not ours", async t => {
+	const {rtc, rooms} = makeFakeRtc()
+	const listener = new Listener({url: "wss://lk.example", jwt: "jwt", isOurs: identity => identity.startsWith("@_ooye_")}, {rtc})
+	/** @type {any[]} */
+	const sounds = []
+	listener.on("soundboard", (identity, sound) => sounds.push([identity, sound]))
+	await listener.connect()
+	const packet = soundboard.encodeSoundboardPacket({url: SOUND_URL, shortcode: "airhorn"})
+	rooms[0].emit(RoomEvent.DataReceived, packet, {identity: "@alice:example.org:ABCDEF"}, 0, "moe.crafty.soundboard")
+	t.deepEqual(sounds, [["@alice:example.org:ABCDEF", {url: SOUND_URL, shortcode: "airhorn", name: "airhorn"}]])
+	await listener.close()
+	t.end()
+})
+
+test("Listener: ignores soundboard packets from our identities, other topics, and invalid packets", async t => {
+	const {rtc, rooms} = makeFakeRtc()
+	const listener = new Listener({url: "wss://lk.example", jwt: "jwt", isOurs: identity => identity.startsWith("@_ooye_")}, {rtc})
+	/** @type {any[]} */
+	const sounds = []
+	listener.on("soundboard", (identity, sound) => sounds.push([identity, sound]))
+	await listener.connect()
+	const room = rooms[0]
+	const good = soundboard.encodeSoundboardPacket({url: SOUND_URL, shortcode: "airhorn"})
+	const alice = {identity: "@alice:example.org:ABCDEF"}
+	const ours = {identity: "@_ooye_sim_555:cadence.moe:DEVICE"}
+	room.emit(RoomEvent.DataReceived, good, ours, 0, "moe.crafty.soundboard")
+	room.emit(RoomEvent.DataReceived, good, alice, 0, "some.other.topic")
+	room.emit(RoomEvent.DataReceived, good, alice, 0, undefined)
+	room.emit(RoomEvent.DataReceived, Buffer.from("not json"), alice, 0, "moe.crafty.soundboard")
+	room.emit(RoomEvent.DataReceived, Buffer.from(`{"url":"https://example.org/x.mp3","shortcode":"a"}`), alice, 0, "moe.crafty.soundboard")
+	room.emit(RoomEvent.DataReceived, Buffer.alloc(2000, 32), alice, 0, "moe.crafty.soundboard")
+	room.emit(RoomEvent.DataReceived, good, null, 0, "moe.crafty.soundboard")
+	t.equal(sounds.length, 0, "nothing was emitted")
+
+	room.emit(RoomEvent.DataReceived, good, alice, 0, "moe.crafty.soundboard")
+	t.equal(sounds.length, 1, "a good packet from someone else still gets through")
 	await listener.close()
 	t.end()
 })

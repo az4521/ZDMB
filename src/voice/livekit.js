@@ -10,6 +10,7 @@ LiveKit media for the voice bridge.
 */
 
 const {EventEmitter} = require("events")
+const {SOUNDBOARD_TOPIC, parseSoundboardPacket} = require("./soundboard")
 
 const SAMPLE_RATE = 48000
 const CHANNELS = 1
@@ -31,6 +32,25 @@ function loadRtc() {
 function mxidFromIdentity(identity) {
 	const index = identity.lastIndexOf(":")
 	return index === -1 ? identity : identity.slice(0, index)
+}
+
+/**
+ * Publishes one data packet from a room's local participant. Never throws.
+ * @param {any} room
+ * @param {Uint8Array} bytes
+ * @param {{topic: string, reliable: boolean}} options
+ * @returns {Promise<boolean>} false if it could not be sent
+ */
+async function publishDataOn(room, bytes, {topic, reliable}) {
+	try {
+		const local = room?.localParticipant
+		if (!local) return false
+		await local.publishData(bytes, {reliable, topic})
+		return true
+	} catch (e) {
+		console.error("[voice] could not publish a LiveKit data packet:", e)
+		return false
+	}
 }
 
 /**
@@ -131,6 +151,17 @@ class Publisher {
 	}
 
 	/**
+	 * Sends one reliable data packet from this publisher's identity. Returns false, and does nothing, when not connected.
+	 * @param {Uint8Array} bytes
+	 * @param {{topic: string, reliable?: boolean}} options
+	 * @returns {Promise<boolean>}
+	 */
+	async publishData(bytes, {topic, reliable = true}) {
+		if (!this.connected || this.closed) return false
+		return publishDataOn(this.room, bytes, {topic, reliable})
+	}
+
+	/**
 	 * Resolves once every frame queued so far has been handed to LiveKit.
 	 * @returns {Promise<void>}
 	 */
@@ -172,6 +203,7 @@ class Listener extends EventEmitter {
 		this.rtc = rtc || loadRtc()
 		/** @type {any} */
 		this.room = null
+		this.connected = false
 		this.closed = false
 		/** @type {Map<string, {track: any, reader: any, rechunker: Rechunker, ended: boolean}>} */
 		this.entries = new Map()
@@ -195,10 +227,40 @@ class Listener extends EventEmitter {
 			this._endAll()
 			this.emit("disconnected", reason)
 		})
+		room.on(rtc.RoomEvent.DataReceived, (/** @type {Uint8Array} */ payload, /** @type {any} */ participant, /** @type {any} */ kind, /** @type {string | undefined} */ topic) => {
+			this._onData(payload, participant, topic)
+		})
 		await room.connect(this.url, this.jwt, {autoSubscribe: true, dynacast: false})
 		if (this.closed) {
 			try { await room.disconnect() } catch (e) {}
+		} else {
+			this.connected = true
 		}
+	}
+
+	/**
+	 * Emits "soundboard" (identity, sound) for a soundboard data packet from someone who is not ours.
+	 * @param {Uint8Array} payload
+	 * @param {any} participant
+	 * @param {string | undefined} topic
+	 */
+	_onData(payload, participant, topic) {
+		if (this.closed || topic !== SOUNDBOARD_TOPIC || !participant) return
+		const identity = participant.identity
+		if (typeof identity !== "string" || this.isOurs(identity)) return
+		const sound = parseSoundboardPacket(payload)
+		if (sound) this.emit("soundboard", identity, sound)
+	}
+
+	/**
+	 * Sends one reliable data packet from the bridge bot's identity. Returns false, and does nothing, when not connected.
+	 * @param {Uint8Array} bytes
+	 * @param {{topic: string, reliable?: boolean}} options
+	 * @returns {Promise<boolean>}
+	 */
+	async publishData(bytes, {topic, reliable = true}) {
+		if (!this.connected || this.closed) return false
+		return publishDataOn(this.room, bytes, {topic, reliable})
 	}
 
 	/**

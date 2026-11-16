@@ -25,6 +25,7 @@
 /**
  * @typedef {Object} RestClient the subset of a snowtransfer instance that we use
  * @property {{editSelf: (guildID: string, data: {nick?: string | null}) => Promise<any>}} guild
+ * @property {{requestHandler: {request: (endpoint: string, params: Record<string, any> | undefined, method: string, dataType: "json", data?: any) => Promise<any>}}} requestHandler
  */
 
 /**
@@ -89,6 +90,21 @@ class VoiceBot {
 			throw e
 		}
 		return connection
+	}
+
+	/**
+	 * Play a Discord soundboard sound in the voice channel this bot is connected to, as this bot. The sound is played natively
+	 * so that everyone hears it as a soundboard sound. Rejects when Discord refuses (for example, missing permissions).
+	 * @param {string} channelID
+	 * @param {string} soundID
+	 * @param {string | null} [sourceGuildID] the guild that owns the sound, when known
+	 * @returns {Promise<any>}
+	 */
+	sendSoundboardSound(channelID, soundID, sourceGuildID = null) {
+		/** @type {{sound_id: string, source_guild_id?: string}} */
+		const body = {sound_id: soundID}
+		if (sourceGuildID) body.source_guild_id = sourceGuildID
+		return this.snow.requestHandler.request(`/channels/${channelID}/send-soundboard-sound`, undefined, "post", "json", body)
 	}
 
 	/**
