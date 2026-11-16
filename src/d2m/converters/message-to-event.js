@@ -150,6 +150,34 @@ function voiceWaveformToMatrix(waveform) {
 }
 
 /**
+ * Uploads a still JPEG frame of a video as a poster thumbnail, using Discord's media proxy.
+ * This is optional, so any failure just means no thumbnail.
+ * @param {Omit<DiscordTypes.APIAttachment, "id" | "proxy_url"> & {proxy_url?: string}} attachment
+ * @returns {Promise<{thumbnail_url?: string, thumbnail_info?: {w: number, h: number, mimetype: string}}>}
+ */
+async function videoThumbnailInfo(attachment) {
+	if (!attachment.proxy_url || !attachment.width || !attachment.height) return {}
+	try {
+		const thumbnailURL = new URL(attachment.proxy_url)
+		thumbnailURL.searchParams.set("format", "jpeg")
+		// Keep the thumbnail within 800x800 while preserving the aspect ratio
+		const longestSide = Math.max(attachment.width, attachment.height)
+		const scale = longestSide > 800 ? 800 / longestSide : 1
+		const w = Math.round(attachment.width * scale)
+		const h = Math.round(attachment.height * scale)
+		thumbnailURL.searchParams.set("width", "" + w)
+		thumbnailURL.searchParams.set("height", "" + h)
+		const thumbnail_url = await file.uploadDiscordFileToMxc(thumbnailURL.toString())
+		return {
+			thumbnail_url,
+			thumbnail_info: {w, h, mimetype: "image/jpeg"}
+		}
+	} catch (e) {
+		return {}
+	}
+}
+
+/**
  * @param {{room?: boolean, user_ids?: string[]}} mentions
  * @param {Omit<DiscordTypes.APIAttachment, "id" | "proxy_url"> & {proxy_url?: string}} attachment
  * @param {boolean} [alwaysLink]
@@ -246,7 +274,8 @@ async function attachmentToEvent(mentions, attachment, alwaysLink, di) {
 				mimetype: attachment.content_type,
 				w: attachment.width,
 				h: attachment.height,
-				size: attachment.size
+				size: attachment.size,
+				...await videoThumbnailInfo(attachment)
 			}
 		}
 	}

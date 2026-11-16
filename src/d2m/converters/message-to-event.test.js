@@ -1203,6 +1203,95 @@ test("message2event: very large png is converted to webp for upload", async t =>
 	}])
 })
 
+test("message2event: video gets a thumbnail from the media proxy, scaled to fit 800x800", async t => {
+	const mainURL = "https://cdn.discordapp.com/attachments/893634327722721290/1463174815119704114/2022-10-18_16-49-46.mp4"
+	const thumbURL = "https://media.discordapp.net/attachments/893634327722721290/1463174815119704114/2022-10-18_16-49-46.mp4?format=jpeg&width=800&height=450"
+	db.prepare("INSERT INTO file (discord_url, mxc_url) VALUES (?, ?)").run(mainURL, "mxc://cadence.moe/testvideomain")
+	db.prepare("INSERT INTO file (discord_url, mxc_url) VALUES (?, ?)").run(thumbURL, "mxc://cadence.moe/testvideothumb")
+	try {
+		const events = await messageToEvent({
+			content: "",
+			attachments: [{
+				id: "1463174815119704114",
+				filename: "2022-10-18_16-49-46.mp4",
+				size: 860559,
+				url: mainURL + "?ex=6970df3c&is=696f8dbc&hm=515d3cbcc8464bdada7f4c3d9ccc8174f671cb75391ce21a46a804fcb1e4befe&",
+				proxy_url: "https://media.discordapp.net/attachments/893634327722721290/1463174815119704114/2022-10-18_16-49-46.mp4?ex=6970df3c&is=696f8dbc&hm=515d3cbcc8464bdada7f4c3d9ccc8174f671cb75391ce21a46a804fcb1e4befe&",
+				width: 1920,
+				height: 1080,
+				content_type: "video/mp4"
+			}]
+		}, data.guild.general, {})
+		t.deepEqual(events, [{
+			$type: "m.room.message",
+			"m.mentions": {},
+			msgtype: "m.video",
+			body: "2022-10-18_16-49-46.mp4",
+			filename: "2022-10-18_16-49-46.mp4",
+			url: "mxc://cadence.moe/testvideomain",
+			external_url: "https://bridge.example.org/download/discordcdn/893634327722721290/1463174815119704114/2022-10-18_16-49-46.mp4",
+			info: {
+				mimetype: "video/mp4",
+				w: 1920,
+				h: 1080,
+				size: 860559,
+				thumbnail_url: "mxc://cadence.moe/testvideothumb",
+				thumbnail_info: {w: 800, h: 450, mimetype: "image/jpeg"}
+			}
+		}])
+	} finally {
+		db.prepare("DELETE FROM file WHERE discord_url IN (?, ?)").run(mainURL, thumbURL)
+	}
+})
+
+test("message2event: portrait video thumbnail keeps aspect ratio when scaled", async t => {
+	const mainURL = "https://cdn.discordapp.com/attachments/112760669178241024/1197621094786531358/Ins_1960637570.mp4"
+	const thumbURL = "https://media.discordapp.net/attachments/112760669178241024/1197621094786531358/Ins_1960637570.mp4?format=jpeg&width=450&height=800"
+	db.prepare("INSERT INTO file (discord_url, mxc_url) VALUES (?, ?)").run(thumbURL, "mxc://cadence.moe/testportraitthumb")
+	try {
+		const events = await messageToEvent({
+			content: "",
+			attachments: [{
+				id: "1197621094786531358",
+				filename: "Ins_1960637570.mp4",
+				size: 860559,
+				url: mainURL + "?ex=65bbee8f&is=65a9798f&hm=ae14f7824c3d526c5e11c162e012e1ee405fd5776e1e9302ed80ccd86503cfda&",
+				proxy_url: "https://media.discordapp.net/attachments/112760669178241024/1197621094786531358/Ins_1960637570.mp4?ex=65bbee8f&is=65a9798f&hm=ae14f7824c3d526c5e11c162e012e1ee405fd5776e1e9302ed80ccd86503cfda&",
+				width: 480,
+				height: 854,
+				content_type: "video/mp4"
+			}]
+		}, data.guild.general, {})
+		t.equal(events[0].msgtype, "m.video")
+		t.equal(events[0].info.thumbnail_url, "mxc://cadence.moe/testportraitthumb")
+		t.deepEqual(events[0].info.thumbnail_info, {w: 450, h: 800, mimetype: "image/jpeg"})
+	} finally {
+		db.prepare("DELETE FROM file WHERE discord_url = ?").run(thumbURL)
+	}
+})
+
+test("message2event: video is still bridged without thumbnail keys if the thumbnail upload fails", async t => {
+	const mainURL = "https://cdn.discordapp.com/attachments/112760669178241024/1197621094786531358/Ins_1960637570.mp4"
+	const events = await messageToEvent({
+		content: "",
+		attachments: [{
+			id: "1197621094786531358",
+			filename: "Ins_1960637570.mp4",
+			size: 860559,
+			url: mainURL + "?ex=65bbee8f&is=65a9798f&hm=ae14f7824c3d526c5e11c162e012e1ee405fd5776e1e9302ed80ccd86503cfda&",
+			proxy_url: "https://media.discordapp.net/attachments/112760669178241024/1197621094786531358/Ins_1960637570.mp4?ex=65bbee8f&is=65a9798f&hm=ae14f7824c3d526c5e11c162e012e1ee405fd5776e1e9302ed80ccd86503cfda&",
+			width: 480,
+			height: 854,
+			content_type: "video/mp4"
+		}]
+	}, data.guild.general, {})
+	t.equal(events.length, 1)
+	t.equal(events[0].msgtype, "m.video")
+	t.equal(events[0].url, "mxc://cadence.moe/kMqLycqMURhVpwleWkmASpnU")
+	t.notOk("thumbnail_url" in events[0].info)
+	t.notOk("thumbnail_info" in events[0].info)
+})
+
 test("message2event: multiple attachments are combined into the same event where possible", async t => {
 	const events = await messageToEvent({
 		content: "hey",
