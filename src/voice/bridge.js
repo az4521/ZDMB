@@ -21,6 +21,7 @@ const audio = require("./audio")
 const livekit = require("./livekit")
 const discordBots = require("./discord-bots")
 const soundboard = require("./soundboard")
+const voicePermissions = require("./permissions")
 
 /** Discord channel types that can be bridged: GuildVoice and GuildStageVoice */
 const VOICE_CHANNEL_TYPES = new Set([2, 13])
@@ -30,6 +31,8 @@ const SPEAKING_SILENCE_MS = 300
 const MONO_FRAME_SAMPLES = 960
 /** Jitter buffer settings for each Matrix participant */
 const PARTICIPANT_BUFFER = {maxMs: 200, primeMs: 40}
+/** How often each active channel logs its one-line voice summary */
+const STATS_INTERVAL_MS = 10e3
 /** Discord nickname length limit */
 const MAX_NICK_LENGTH = 32
 /** Sounds from one Matrix sender closer together than this are dropped, as Zam does */
@@ -44,6 +47,37 @@ const soundCache = new soundboard.LruCache(16)
 let ffmpegMissing = false
 /** Discord soundboard sounds being bridged, so that _idle() can wait for them */
 const pendingDiscordSounds = new Set()
+/** Voice connections whose state changes are already logged */
+const loggedConnections = new WeakSet()
+
+/**
+ * Per-channel counters for the summary line, reset every STATS_INTERVAL_MS.
+ * @returns {{matrixAudio: number, discordFrames: number, anchor: {nonSilent: number, silent: number}, puppet: {nonSilent: number, silent: number}}}
+ */
+function newStats() {
+	return {matrixAudio: 0, discordFrames: 0, anchor: {nonSilent: 0, silent: 0}, puppet: {nonSilent: 0, silent: 0}}
+}
+
+/**
+ * @param {Int16Array} samples
+ * @returns {boolean} true when every sample is zero
+ */
+function isSilentSamples(samples) {
+	for (let i = 0; i < samples.length; i++) {
+		if (samples[i] !== 0) return false
+	}
+	return true
+}
+
+/**
+ * Runs logging-only setup. Logging must never break audio, so any failure is ignored.
+ * @param {() => void} attach
+ */
+function attachLogging(attach) {
+	try {
+		attach()
+	} catch (e) {}
+}
 
 /**
  * Collaborators. Replace entries in tests. Each one is resolved when it is first used, so that loading this module
@@ -175,13 +209,32 @@ function isVoiceChannel(channelID) {
  * Play a live PCM stream through a voice connection.
  * @param {any} connection
  * @param {import("./audio").LivePcmStream} stream
+ * @param {string} label who this audio is for, used in log lines
  * @returns {any} the audio player
  */
-function playStream(connection, stream) {
+function playStream(connection, stream, label) {
 	const voice = _deps.voiceLib()
 	const player = voice.createAudioPlayer({behaviors: {noSubscriber: voice.NoSubscriberBehavior.Play}})
+	attachLogging(() => {
+		player.on("error", (/** @type {any} */ e) => console.error(`[voice] ${label} player error:`, e))
+		player.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
+			console.log(`[voice] ${label} player: ${oldState?.status} -> ${newState?.status}`)
+		})
+	})
+	attachLogging(() => {
+		if (loggedConnections.has(connection)) return
+		loggedConnections.add(connection)
+		connection.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
+			console.log(`[voice] voice connection to channel ${connection.joinConfig?.channelId}: ${oldState?.status} -> ${newState?.status}`)
+		})
+	})
 	player.play(voice.createAudioResource(stream, {inputType: voice.StreamType.Raw}))
-	connection.subscribe(player)
+	const subscription = connection.subscribe(player)
+	if (subscription) {
+		console.log(`[voice] ${label} player subscribed to its voice connection`)
+	} else {
+		console.error(`[voice] ${label} player is NOT subscribed: connection.subscribe(player) returned undefined`)
+	}
 	return player
 }
 
@@ -297,6 +350,10 @@ class ChannelBridge {
 		this.soundClips = new soundboard.SoundClips()
 		/** @type {Map<string, {lastAt: number, slots: {endsAt: number}[]}>} LiveKit identity to that sender's recent sounds */
 		this.soundSenders = new Map()
+		/** @type {ReturnType<typeof newStats>} counters for the summary line */
+		this.stats = newStats()
+		/** @type {NodeJS.Timeout | null} */
+		this.statsTimer = null
 	}
 
 	/**
@@ -427,8 +484,9 @@ class ChannelBridge {
 			}
 			connection.receiver.speaking.on("start", this.onStart)
 			this.anchorStream = new audio.LivePcmStream(() => this.pullOverflow())
-			this.anchorPlayer = playStream(connection, this.anchorStream)
+			this.anchorPlayer = playStream(connection, this.anchorStream, `anchor ${anchor.userID} in ${this.channelID}`)
 			this.active = true
+			this.startStatsTimer()
 
 			const lk = _deps.livekit()
 			const credentials = await _deps.matrixRTC().getLiveKitCredentials(_deps.mxUtils().bot, this.roomID)
@@ -467,6 +525,7 @@ class ChannelBridge {
 	async teardown() {
 		const {anchor, connection, onStart, anchorPlayer, anchorStream, listener} = this
 		this.active = false
+		this.stopStatsTimer()
 		this.anchor = null
 		this.soundClips.clear()
 		this.connection = null
@@ -581,6 +640,7 @@ class ChannelBridge {
 		opus.on("data", (/** @type {Buffer} */ packet) => {
 			try {
 				entry.publisher.pushMono(audio.stereoToMono(entry.decoder.decode(packet)))
+				this.stats.discordFrames++
 			} catch (e) {
 				// A single bad packet is dropped
 			}
@@ -607,6 +667,7 @@ class ChannelBridge {
 	 */
 	onTrackStart(identity, mxid) {
 		if (this.participants.has(identity)) return
+		console.log(`[voice] ${mxid} started a microphone track (${identity}) in ${this.channelID}`)
 		/** @type {Participant} */
 		const participant = {
 			identity,
@@ -632,26 +693,38 @@ class ChannelBridge {
 		if (bot) {
 			participant.bot = bot
 			participant.joining = true
+			console.log(`[voice] ${participant.mxid} is joining ${this.channelID} on dedicated puppet ${bot.userID}`)
 			/** @type {any} */
 			let connection = null
 			try {
 				connection = await bot.join(this.guildID, this.channelID)
 				await bot.setNick(this.guildID, await this.nickFor(participant.mxid))
 			} catch (e) {
-				console.error(`[voice] dedicated bot could not join for ${participant.mxid}, so it is mixed in instead:`, e)
+				console.error(`[voice] dedicated bot ${bot.userID} could not join for ${participant.mxid}, so it is mixed in instead:`, e)
 			}
 			participant.joining = false
 			if (connection && !participant.ended) {
-				const stream = new audio.LivePcmStream(() => audio.monoToStereo(participantFrame(participant)))
+				const stream = new audio.LivePcmStream(() => {
+					const mono = participantFrame(participant)
+					this.countFrame("puppet", mono)
+					return audio.monoToStereo(mono)
+				})
 				participant.stream = stream
-				participant.player = playStream(connection, stream)
+				participant.player = playStream(connection, stream, `puppet ${bot.userID} for ${participant.mxid}`)
+				console.log(`[voice] ${participant.mxid} is on dedicated puppet ${bot.userID}`)
 				return
 			}
 			// Failed, or the participant left while joining: give the bot back
+			console.log(`[voice] puppet ${bot.userID} for ${participant.mxid} is released without playing (${connection ? "participant left" : "join failed"})`)
 			participant.bot = null
 			await pool.release(bot, this.guildID)
+		} else {
+			console.log(`[voice] no free puppet for ${participant.mxid} in guild ${this.guildID}, so it is mixed into the anchor's output`)
 		}
-		if (!participant.ended) this.overflow.set(participant.identity, participant)
+		if (!participant.ended) {
+			this.overflow.set(participant.identity, participant)
+			console.log(`[voice] ${participant.mxid} is in the anchor's overflow mix`)
+		}
 	}
 
 	/**
@@ -676,6 +749,7 @@ class ChannelBridge {
 	 * @param {Int16Array} samples
 	 */
 	onAudio(identity, samples) {
+		this.stats.matrixAudio++
 		const participant = this.participants.get(identity)
 		if (participant) participant.buffer.push(samples)
 	}
@@ -685,6 +759,7 @@ class ChannelBridge {
 	 */
 	onTrackEnd(identity) {
 		const participant = this.participants.get(identity)
+		console.log(`[voice] microphone track of ${identity} ended in ${this.channelID}${participant ? "" : " (not a bridged participant)"}`)
 		if (participant) this.track(this.endParticipant(participant))
 	}
 
@@ -810,8 +885,49 @@ class ChannelBridge {
 		const frames = [...this.overflow.values()].map(participantFrame)
 		const loose = this.soundClips.read(MONO_FRAME_SAMPLES)
 		if (loose) frames.push(loose)
-		if (frames.length === 0) return null
-		return audio.monoToStereo(audio.mixMono(frames, MONO_FRAME_SAMPLES))
+		if (frames.length === 0) {
+			this.stats.anchor.silent++
+			return null
+		}
+		const mixed = audio.mixMono(frames, MONO_FRAME_SAMPLES)
+		this.countFrame("anchor", mixed)
+		return audio.monoToStereo(mixed)
+	}
+
+	/**
+	 * Counts one 20 ms mono frame emitted by an anchor or puppet stream. Never throws.
+	 * @param {"anchor" | "puppet"} kind
+	 * @param {Int16Array} mono
+	 */
+	countFrame(kind, mono) {
+		try {
+			const counts = this.stats[kind]
+			if (isSilentSamples(mono)) counts.silent++
+			else counts.nonSilent++
+		} catch (e) {}
+	}
+
+	startStatsTimer() {
+		this.stopStatsTimer()
+		this.statsTimer = setInterval(() => this.logStats(), STATS_INTERVAL_MS)
+		this.statsTimer.unref()
+	}
+
+	stopStatsTimer() {
+		if (this.statsTimer) clearInterval(this.statsTimer)
+		this.statsTimer = null
+	}
+
+	/**
+	 * Logs one summary line for this channel and resets the counters. Never throws.
+	 */
+	logStats() {
+		try {
+			const stats = this.stats
+			this.stats = newStats()
+			const seconds = STATS_INTERVAL_MS / 1000
+			console.log(`[voice] ${this.channelID} last ${seconds}s: matrixParticipants=${this.participants.size} matrixAudioFrames=${stats.matrixAudio} anchor(nonSilent=${stats.anchor.nonSilent} silent=${stats.anchor.silent}) puppets(nonSilent=${stats.puppet.nonSilent} silent=${stats.puppet.silent}) discordFramesToPublishers=${stats.discordFrames}`)
+		} catch (e) {}
 	}
 }
 
@@ -951,9 +1067,12 @@ async function start() {
 	}
 
 	const rtc = _deps.matrixRTC()
+	/** @type {Set<string>} guilds with at least one bridged voice or stage channel */
+	const bridgedVoiceGuildIDs = new Set()
 	for (const row of _deps.bridgedChannelRows()) {
 		const channel = discord.channels.get(row.channel_id)
 		if (!channel || !VOICE_CHANNEL_TYPES.has(channel.type)) continue
+		bridgedVoiceGuildIDs.add(channel.guild_id)
 		const bridge = getOrCreateBridge(channel.guild_id, row.channel_id, row.room_id)
 
 		try {
@@ -972,6 +1091,11 @@ async function start() {
 			console.error(`[voice] could not read call members of ${row.room_id}:`, e)
 		}
 	}
+
+	// Puppets that were already Ready are checked now. Puppets that become Ready later are checked by the hook, which is set
+	// only after this check, so that no puppet is checked twice.
+	voicePermissions.checkVoicePermissions({discord, pool, bridgedVoiceGuildIDs})
+	pool.onPuppetReady = bot => voicePermissions.checkVoicePermissions({discord, pool, bridgedVoiceGuildIDs, puppet: bot})
 
 	sweepTimer = setInterval(() => {
 		sweepMatrixMembers().catch(e => console.error("[voice] call member sweep failed:", e))

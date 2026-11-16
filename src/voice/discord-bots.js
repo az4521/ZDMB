@@ -238,6 +238,8 @@ class BotPool {
 		this.puppets = []
 		/** @type {Map<string, Set<string>>} guildID -> userIDs of bots currently allocated there */
 		this.allocations = new Map()
+		/** @type {((bot: VoiceBot) => void) | null} called once for each puppet, when it first becomes Ready */
+		this.onPuppetReady = null
 	}
 
 	/**
@@ -283,7 +285,9 @@ class BotPool {
 	 * @param {VoiceBot} bot
 	 */
 	registerPuppet(bot) {
-		if (!this.puppets.includes(bot)) this.puppets.push(bot)
+		if (this.puppets.includes(bot)) return
+		this.puppets.push(bot)
+		this.onPuppetReady?.(bot)
 	}
 
 	/**

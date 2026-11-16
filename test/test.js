@@ -158,6 +158,7 @@ file._actuallyUploadDiscordFileToMxc = function(url, res) { throw new Error(`Not
 	require("../src/voice/matrix-rtc.test")
 	require("../src/voice/livekit.test")
 	require("../src/voice/soundboard.test")
+	require("../src/voice/permissions.test")
 	require("../src/voice/bridge.test")
 	require("../src/d2m/converters/emoji-to-key.test")
 	require("../src/d2m/converters/find-mentions.test")

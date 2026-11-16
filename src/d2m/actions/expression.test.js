@@ -58,13 +58,42 @@ test("soundsToState: builds the pack with display name and sound metadata", asyn
 					"moe.crafty.zdmb.discord_sound": {
 						id: "100",
 						guild_id: guild.id,
-						volume: 0.5,
+						volume_percent: 50,
 						emoji_id: "42",
 						emoji_name: "📯"
 					}
 				}
 			}
 		})
+	})
+})
+
+test("soundsToState: volume is sent as an integer percentage, never a float", async t => {
+	await withUploadStub(okUpload, async () => {
+		const result = await soundsToState([
+			sound({sound_id: "1", name: "quiet", volume: 0.37}),
+			sound({sound_id: "2", name: "loud", volume: 0.999}),
+			sound({sound_id: "3", name: "full", volume: 1})
+		], guild)
+		t.equal(result.sounds.quiet["moe.crafty.zdmb.discord_sound"].volume_percent, 37)
+		t.equal(result.sounds.loud["moe.crafty.zdmb.discord_sound"].volume_percent, 100)
+		t.equal(result.sounds.full["moe.crafty.zdmb.discord_sound"].volume_percent, 100)
+		for (const key of ["quiet", "loud", "full"]) {
+			const meta = result.sounds[key]["moe.crafty.zdmb.discord_sound"]
+			t.ok(Number.isInteger(meta.volume_percent))
+			t.notOk("volume" in meta)
+		}
+	})
+})
+
+test("soundsToState: omits volume_percent when the volume is not a finite number", async t => {
+	await withUploadStub(okUpload, async () => {
+		const result = await soundsToState([
+			sound({sound_id: "1", name: "missing", volume: undefined}),
+			sound({sound_id: "2", name: "nan", volume: NaN})
+		], guild)
+		t.notOk("volume_percent" in result.sounds.missing["moe.crafty.zdmb.discord_sound"])
+		t.notOk("volume_percent" in result.sounds.nan["moe.crafty.zdmb.discord_sound"])
 	})
 })
 

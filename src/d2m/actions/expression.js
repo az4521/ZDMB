@@ -118,6 +118,26 @@ function planSoundShortcodes(sounds) {
 }
 
 /**
+ * The Zam-specific metadata on a sound. Matrix canonical JSON forbids non-integer numbers, so Discord's 0..1 float
+ * volume is sent as an integer percentage, and only when it is a finite number.
+ * @param {DiscordTypes.APISoundboardSound} sound
+ * @param {DiscordTypes.APIGuild} guild
+ */
+function discordSoundContent(sound, guild) {
+	/** @type {{id: string, guild_id: string, volume_percent?: number, emoji_id: string | null, emoji_name: string | null}} */
+	const content = {
+		id: sound.sound_id,
+		guild_id: guild.id,
+		emoji_id: sound.emoji_id ?? null,
+		emoji_name: sound.emoji_name ?? null
+	}
+	if (typeof sound.volume === "number" && Number.isFinite(sound.volume)) {
+		content.volume_percent = Math.round(sound.volume * 100)
+	}
+	return content
+}
+
+/**
  * @param {DiscordTypes.APISoundboardSound[]} sounds
  * @param {DiscordTypes.APIGuild} guild
  */
@@ -138,13 +158,7 @@ async function soundsToState(sounds, guild) {
 				info: {
 					mimetype: "audio/mpeg"
 				},
-				"moe.crafty.zdmb.discord_sound": {
-					id: sound.sound_id,
-					guild_id: guild.id,
-					volume: sound.volume,
-					emoji_id: sound.emoji_id ?? null,
-					emoji_name: sound.emoji_name ?? null
-				}
+				"moe.crafty.zdmb.discord_sound": discordSoundContent(sound, guild)
 			}
 		}), e => {
 			console.error(`[soundboard] skipping sound ${sound.name} (${sound.sound_id}) in guild ${guild.id}: failed to upload`, e)

@@ -112,6 +112,18 @@ function addPuppet(pool, userID, guildIDs, voice) {
 	return {bot, cloud, snow}
 }
 
+test("voicebot pool: onPuppetReady runs once per puppet", t => {
+	const pool = new BotPool()
+	/** @type {VoiceBot[]} */
+	const seen = []
+	pool.onPuppetReady = bot => seen.push(bot)
+	const bot = new VoiceBot({userID: "200", isMain: false, cloud: fakeCloud(), snow: fakeSnow()})
+	pool.registerPuppet(bot)
+	pool.registerPuppet(bot)
+	t.deepEqual(seen, [bot])
+	t.equal(pool.puppets.length, 1)
+})
+
 test("voicebot adapter: forwards only own voice state and matching guild server update", t => {
 	const voice = fakeVoiceLib()
 	const bot = new VoiceBot({userID: "200", isMain: false, cloud: fakeCloud(), snow: fakeSnow(), voiceLib: () => voice})
