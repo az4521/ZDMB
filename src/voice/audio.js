@@ -12,13 +12,6 @@ const MONO_FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS / 1000
 const STEREO_FRAME_BYTES = 3840
 
 /**
- * Stops LivePcmStream from bursting frames to catch up after a long event
- * loop stall: if a tick is more than this many frames late, the timeline is
- * shifted forward instead.
- */
-const MAX_LATE_FRAMES = 5
-
-/**
  * @param {number} ms
  * @returns {number}
  */
@@ -166,31 +159,26 @@ class JitterBuffer {
 }
 
 /**
- * Readable (non-object mode) that emits one 3840-byte stereo s16le frame every
- * 20 ms, pulled from a callback. Designed for @discordjs/voice's
- * StreamType.Raw, which reads every 20 ms and gives up after 5 missed frames.
+ * Readable (non-object mode) that produces one 3840-byte stereo s16le frame per read, pulled from a callback.
+ * Designed for @discordjs/voice's StreamType.Raw.
  *
- * - The timer starts on the first _read() and is aligned to a wall-clock
- *   timeline (each tick is scheduled against start + index * 20 ms), so it
- *   does not drift.
+ * Production is demand-driven and has no timer. The voice library pipes this stream into an Opus encoder, and the
+ * player reads one packet every 20 ms from that encoder, so backpressure makes this stream produce exactly as fast as
+ * the player consumes. A timer tied to wall-clock time would underrun on ordinary jitter, and the player goes Idle
+ * for good after a few missed frames.
+ *
+ * - _read() pushes frames synchronously until push() returns false, so at most highWaterMark bytes are ever produced ahead.
  * - If pull() returns null, a frame of silence is emitted.
- * - When push() returns false the stream pauses producing; the next _read()
- *   resumes it with a fresh timeline.
- * - stop() clears the timer and ends the stream.
+ * - If pull() throws, the stream is destroyed with that error.
+ * - stop() ends the stream (push(null)) and stops producing.
  */
 class LivePcmStream extends Readable {
 	/** @type {() => Buffer | null} */
 	#pull
-	/** @type {ReturnType<typeof setTimeout> | null} */
-	#timer = null
-	#anchor = 0
-	#index = 0
-	#started = false
-	#paused = false
 	#stopped = false
 
 	/**
-	 * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence
+	 * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence. Must not block.
 	 */
 	constructor(pull) {
 		// Keep only a few frames buffered ahead of the consumer.
@@ -199,68 +187,29 @@ class LivePcmStream extends Readable {
 	}
 
 	_read() {
-		if (this.#stopped) return
-		// Already producing: nothing to do.
-		if (this.#started && !this.#paused) return
-		this.#started = true
-		this.#paused = false
-		this.#anchor = Date.now()
-		this.#index = 0
-		this.#schedule()
+		try {
+			while (!this.#stopped && this.push(this.#nextFrame())) {
+				// Keep producing until the buffer is at its high-water mark
+			}
+		} catch (err) {
+			this.#stopped = true
+			this.destroy(/** @type {Error} */ (err))
+		}
 	}
 
 	/** @param {Error | null} err @param {(err?: Error | null) => void} callback */
 	_destroy(err, callback) {
-		this.#halt()
+		this.#stopped = true
 		callback(err)
 	}
 
 	/**
-	 * Ends the stream: cancels the timer and pushes EOF.
+	 * Ends the stream. Frames already buffered are still delivered, then EOF.
 	 */
 	stop() {
 		if (this.#stopped) return
-		this.#halt()
-		this.push(null)
-	}
-
-	#halt() {
 		this.#stopped = true
-		if (this.#timer) clearTimeout(this.#timer)
-		this.#timer = null
-	}
-
-	#schedule() {
-		if (this.#timer) clearTimeout(this.#timer)
-		const due = this.#anchor + this.#index * FRAME_MS
-		const delay = Math.max(0, due - Date.now())
-		this.#timer = setTimeout(() => this.#tick(), delay)
-	}
-
-	#tick() {
-		this.#timer = null
-		if (this.#stopped) return
-
-		const due = this.#anchor + this.#index * FRAME_MS
-		const lateBy = Date.now() - due
-		if (lateBy > MAX_LATE_FRAMES * FRAME_MS) this.#anchor += lateBy
-
-		/** @type {Buffer} */
-		let frame
-		try {
-			frame = this.#nextFrame()
-		} catch (err) {
-			this.#halt()
-			this.destroy(/** @type {Error} */ (err))
-			return
-		}
-
-		this.#index++
-		if (this.push(frame)) {
-			this.#schedule()
-		} else {
-			this.#paused = true
-		}
+		this.push(null)
 	}
 
 	/** @returns {Buffer} */

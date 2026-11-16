@@ -41,6 +41,10 @@ const SOUND_MIN_GAP_MS = 250
 const SOUND_MAX_CONCURRENT = 3
 /** Assumed length of a native Discord soundboard sound (Discord caps them at 5 s), for the concurrency limit */
 const NATIVE_SOUND_MS = 5000
+/** Players give up (go Idle) after this many 20 ms frames in a row with nothing to play. The library default is 5. */
+const MAX_MISSED_FRAMES = 50
+/** A player that went Idle while still wanted is restarted, but no more often than this */
+const RESTART_MIN_MS = 1000
 /** Decoded sounds, by mxc URL */
 const soundCache = new soundboard.LruCache(16)
 /** Set after ffmpeg is found to be missing, so that it is reported once and Matrix sounds are then skipped */
@@ -135,8 +139,7 @@ const _deps = {
  * @property {boolean} ended
  * @property {boolean} joining the dedicated puppet is still joining the channel
  * @property {any} bot dedicated puppet, if any
- * @property {any} player
- * @property {import("./audio").LivePcmStream | null} stream
+ * @property {PcmPlayback | null} playback the puppet's audio, once it is playing
  * @property {import("./soundboard").SoundClips} clips sounds playing on top of this participant's audio
  */
 
@@ -206,36 +209,88 @@ function isVoiceChannel(channelID) {
 }
 
 /**
- * Play a live PCM stream through a voice connection.
- * @param {any} connection
- * @param {import("./audio").LivePcmStream} stream
- * @param {string} label who this audio is for, used in log lines
- * @returns {any} the audio player
+ * @typedef {Object} PcmPlayback a live PCM feed playing through a voice connection
+ * @property {() => void} stop ends the feed and its player. Never restarts it.
  */
-function playStream(connection, stream, label) {
+
+/**
+ * Plays a live PCM feed through a voice connection. If the player goes Idle while `isWanted()` still holds, the feed is
+ * started again with a fresh player and stream that pull from the same source, at most once per RESTART_MIN_MS.
+ * @param {any} connection
+ * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence. Must not block.
+ * @param {string} label who this audio is for, used in log lines
+ * @param {() => boolean} isWanted whether the owner still wants this audio playing
+ * @returns {PcmPlayback}
+ */
+function playPcm(connection, pull, label, isWanted) {
 	const voice = _deps.voiceLib()
-	const player = voice.createAudioPlayer({behaviors: {noSubscriber: voice.NoSubscriberBehavior.Play}})
-	attachLogging(() => {
-		player.on("error", (/** @type {any} */ e) => console.error(`[voice] ${label} player error:`, e))
-		player.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
-			console.log(`[voice] ${label} player: ${oldState?.status} -> ${newState?.status}`)
+	let stopped = false
+	/** @type {any} the current player */
+	let player = null
+	/** @type {import("./audio").LivePcmStream | null} the current stream */
+	let stream = null
+	/** @type {ReturnType<typeof setTimeout> | null} */
+	let restartTimer = null
+	let startedAt = -Infinity
+
+	/** Creates a player and a stream for `pull`, and starts them. */
+	function start() {
+		startedAt = Date.now()
+		const currentPlayer = voice.createAudioPlayer({behaviors: {noSubscriber: voice.NoSubscriberBehavior.Play, maxMissedFrames: MAX_MISSED_FRAMES}})
+		const currentStream = new audio.LivePcmStream(pull)
+		player = currentPlayer
+		stream = currentStream
+		attachLogging(() => {
+			currentPlayer.on("error", (/** @type {any} */ e) => console.error(`[voice] ${label} player error:`, e))
+			currentPlayer.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
+				console.log(`[voice] ${label} player: ${oldState?.status} -> ${newState?.status}`)
+				if (newState?.status === "idle" && oldState?.status !== "idle") onIdle(currentPlayer)
+			})
 		})
-	})
-	attachLogging(() => {
-		if (loggedConnections.has(connection)) return
-		loggedConnections.add(connection)
-		connection.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
-			console.log(`[voice] voice connection to channel ${connection.joinConfig?.channelId}: ${oldState?.status} -> ${newState?.status}`)
+		attachLogging(() => {
+			if (loggedConnections.has(connection)) return
+			loggedConnections.add(connection)
+			connection.on("stateChange", (/** @type {any} */ oldState, /** @type {any} */ newState) => {
+				console.log(`[voice] voice connection to channel ${connection.joinConfig?.channelId}: ${oldState?.status} -> ${newState?.status}`)
+			})
 		})
-	})
-	player.play(voice.createAudioResource(stream, {inputType: voice.StreamType.Raw}))
-	const subscription = connection.subscribe(player)
-	if (subscription) {
-		console.log(`[voice] ${label} player subscribed to its voice connection`)
-	} else {
-		console.error(`[voice] ${label} player is NOT subscribed: connection.subscribe(player) returned undefined`)
+		currentPlayer.play(voice.createAudioResource(currentStream, {inputType: voice.StreamType.Raw}))
+		const subscription = connection.subscribe(currentPlayer)
+		if (subscription) {
+			console.log(`[voice] ${label} player subscribed to its voice connection`)
+		} else {
+			console.error(`[voice] ${label} player is NOT subscribed: connection.subscribe(player) returned undefined`)
+		}
 	}
-	return player
+
+	/** @param {any} went the player that just went Idle */
+	function onIdle(went) {
+		if (stopped || went !== player || restartTimer || !isWanted()) return
+		console.error(`[voice] ${label} player went Idle while its audio is still wanted, so it is started again`)
+		restartTimer = setTimeout(restart, Math.max(0, startedAt + RESTART_MIN_MS - Date.now()))
+	}
+
+	function restart() {
+		restartTimer = null
+		if (stopped || !isWanted()) return
+		try { stream?.stop() } catch (e) {}
+		start()
+	}
+
+	start()
+	return {
+		stop() {
+			stopped = true
+			if (restartTimer) clearTimeout(restartTimer)
+			restartTimer = null
+			const oldPlayer = player
+			const oldStream = stream
+			player = null
+			stream = null
+			try { oldPlayer?.stop() } catch (e) {}
+			try { oldStream?.stop() } catch (e) {}
+		},
+	}
 }
 
 /**
@@ -338,10 +393,8 @@ class ChannelBridge {
 		this.anchor = null
 		/** @type {any} */
 		this.connection = null
-		/** @type {import("./audio").LivePcmStream | null} */
-		this.anchorStream = null
-		/** @type {any} */
-		this.anchorPlayer = null
+		/** @type {PcmPlayback | null} the anchor's output */
+		this.anchorPlayback = null
 		/** @type {((userID: string) => void) | null} */
 		this.onStart = null
 		/** @type {any} the LiveKit listener */
@@ -483,8 +536,7 @@ class ChannelBridge {
 				}
 			}
 			connection.receiver.speaking.on("start", this.onStart)
-			this.anchorStream = new audio.LivePcmStream(() => this.pullOverflow())
-			this.anchorPlayer = playStream(connection, this.anchorStream, `anchor ${anchor.userID} in ${this.channelID}`)
+			this.anchorPlayback = playPcm(connection, () => this.pullOverflow(), `anchor ${anchor.userID} in ${this.channelID}`, () => this.active && this.connection === connection)
 			this.active = true
 			this.startStatsTimer()
 
@@ -523,15 +575,14 @@ class ChannelBridge {
 	 * Undoes whatever activate() set up. Safe to call when nothing is active. Only run from the queue.
 	 */
 	async teardown() {
-		const {anchor, connection, onStart, anchorPlayer, anchorStream, listener} = this
+		const {anchor, connection, onStart, anchorPlayback, listener} = this
 		this.active = false
 		this.stopStatsTimer()
 		this.anchor = null
 		this.soundClips.clear()
 		this.connection = null
 		this.onStart = null
-		this.anchorPlayer = null
-		this.anchorStream = null
+		this.anchorPlayback = null
 		this.listener = null
 
 		if (listener) {
@@ -546,8 +597,7 @@ class ChannelBridge {
 		for (const participant of [...this.participants.values()]) await this.endParticipant(participant)
 
 		if (connection && onStart) connection.receiver?.speaking?.off?.("start", onStart)
-		try { anchorPlayer?.stop() } catch (e) {}
-		try { anchorStream?.stop() } catch (e) {}
+		try { anchorPlayback?.stop() } catch (e) {}
 		if (anchor) await _deps.pool().release(anchor, this.guildID)
 	}
 
@@ -676,8 +726,7 @@ class ChannelBridge {
 			ended: false,
 			joining: false,
 			bot: null,
-			player: null,
-			stream: null,
+			playback: null,
 			clips: new soundboard.SoundClips(),
 		}
 		this.participants.set(identity, participant)
@@ -704,13 +753,11 @@ class ChannelBridge {
 			}
 			participant.joining = false
 			if (connection && !participant.ended) {
-				const stream = new audio.LivePcmStream(() => {
+				participant.playback = playPcm(connection, () => {
 					const mono = participantFrame(participant)
 					this.countFrame("puppet", mono)
 					return audio.monoToStereo(mono)
-				})
-				participant.stream = stream
-				participant.player = playStream(connection, stream, `puppet ${bot.userID} for ${participant.mxid}`)
+				}, `puppet ${bot.userID} for ${participant.mxid}`, () => !participant.ended)
 				console.log(`[voice] ${participant.mxid} is on dedicated puppet ${bot.userID}`)
 				return
 			}
@@ -772,10 +819,8 @@ class ChannelBridge {
 		participant.ended = true
 		if (this.participants.get(participant.identity) === participant) this.participants.delete(participant.identity)
 		this.overflow.delete(participant.identity)
-		try { participant.stream?.stop() } catch (e) {}
-		try { participant.player?.stop() } catch (e) {}
-		participant.stream = null
-		participant.player = null
+		try { participant.playback?.stop() } catch (e) {}
+		participant.playback = null
 		participant.clips.clear()
 		// While the puppet is still joining, attachParticipant gives it back once the join finishes
 		if (participant.bot && !participant.joining) {
@@ -1004,23 +1049,51 @@ function handleMatrixCallMember(event) {
  * @param {any} data a VOICE_CHANNEL_EFFECT_SEND payload
  */
 async function handleDiscordSoundboard(data) {
-	if (!data.sound_id) return // an emoji-only effect
+	const where = `channel ${data.channel_id} in guild ${data.guild_id}`
+	if (!data.sound_id) {
+		console.log(`[soundboard] not bridged: the effect in ${where} has no sound_id (an emoji-only effect)`)
+		return
+	}
 	const soundID = String(data.sound_id)
 	const bridge = channelBridges.get(bridgeKey(data.guild_id, data.channel_id))
-	if (!bridge || !bridge.active || !bridge.listener) return
+	if (!bridge) {
+		console.log(`[soundboard] not bridged: sound ${soundID} was played in ${where}, which is not a bridged channel`)
+		return
+	}
+	if (!bridge.active) {
+		console.log(`[soundboard] not bridged: sound ${soundID} was played in ${where}, whose bridge is not active`)
+		return
+	}
+	if (!bridge.listener) {
+		console.log(`[soundboard] not bridged: sound ${soundID} was played in ${where}, which has no listener`)
+		return
+	}
 
 	// Same shortcode as in the guild's synced sound pack (including the _2 suffixes for duplicate names)
 	const guildSounds = _deps.discord().guilds.get(data.guild_id)?.soundboard_sounds ?? []
 	const planned = require("../d2m/actions/expression").planSoundShortcodes(guildSounds).find(p => String(p.sound.sound_id) === soundID)
 	const shortcode = planned ? planned.shortcode : soundboard.shortcodeForName("sound")
 	const url = `https://cdn.discordapp.com/soundboard-sounds/${soundID}`
-	const mxc = await _deps.file().uploadDiscordFileToMxc(url)
+	/** @type {string} */
+	let mxc
+	try {
+		mxc = await _deps.file().uploadDiscordFileToMxc(url)
+	} catch (e) {
+		console.error(`[soundboard] could not upload sound ${soundID} from Discord to Matrix, so it is not bridged:`, e)
+		return
+	}
 	const bytes = soundboard.encodeSoundboardPacket({url: mxc, shortcode})
 
 	// Zam attributes the sound to whoever sends it, so send it from the speaker's own publisher when they have one
 	const entry = bridge.publishers.get(String(data.user_id))
 	const sender = entry && entry.publisher.connected ? entry.publisher : bridge.listener
-	await sender.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC, reliable: true})
+	const identity = entry && sender === entry.publisher ? entry.mxid : "the bridge bot"
+	const sent = await sender.publishData(bytes, {topic: soundboard.SOUNDBOARD_TOPIC, reliable: true})
+	if (sent === false) {
+		console.error(`[soundboard] LiveKit did not send sound ${soundID} (${mxc}) from ${identity} in ${where}`)
+		return
+	}
+	console.log(`[soundboard] sent sound ${soundID} as ${mxc} from ${identity} in ${where}`)
 }
 
 /**
@@ -1028,13 +1101,17 @@ async function handleDiscordSoundboard(data) {
  * @param {any} data the gateway payload: guild_id, channel_id, user_id, sound_id, sound_volume, emoji
  */
 function onDiscordSoundboard(data) {
-	if (!started) return
 	try {
-		const work = handleDiscordSoundboard(data).catch(e => console.error("[voice] failed to bridge a soundboard sound from Discord:", e))
+		console.log(`[soundboard] VOICE_CHANNEL_EFFECT_SEND from Discord: guild=${data?.guild_id} channel=${data?.channel_id} user=${data?.user_id} sound_id=${data?.sound_id ?? "none"} emoji=${data?.emoji?.name ?? "none"}`)
+		if (!started) {
+			console.log("[soundboard] not bridged: the voice bridge has not started")
+			return
+		}
+		const work = handleDiscordSoundboard(data).catch(e => console.error("[soundboard] failed to bridge a soundboard sound from Discord:", e))
 		pendingDiscordSounds.add(work)
 		work.then(() => pendingDiscordSounds.delete(work))
 	} catch (e) {
-		console.error("[voice] failed to handle a soundboard sound from Discord:", e)
+		console.error("[soundboard] failed to handle a soundboard sound from Discord:", e)
 	}
 }
 

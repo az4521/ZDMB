@@ -205,8 +205,9 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 		/** @type {any[]} */
 		players: [],
 		createAudioPlayer() {
-			const player = {
-				/** @type {any} */
+			/** @type {any} */
+			const player = new EventEmitter()
+			Object.assign(player, {
 				resource: null,
 				stopped: false,
 				play(/** @type {any} */ resource) {
@@ -215,7 +216,7 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 				stop() {
 					player.stopped = true
 				},
-			}
+			})
 			voiceLib.players.push(player)
 			return player
 		},
@@ -1003,6 +1004,31 @@ test("voice bridge: a Matrix sound over 1 MiB is refused without being decoded",
 		t.equal(env.media.decodes, 0)
 		const cb = bridge._channelBridges.get(CHANNEL_KEY)
 		t.equal(cb.soundClips.active, false)
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a player that goes Idle while its channel is active is started again, but not after teardown", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+		const [first] = env.voiceLib.players
+		t.equal(env.voiceLib.players.length, 1, "the anchor has one player")
+
+		first.emit("stateChange", {status: "playing"}, {status: "idle"})
+		await new Promise(resolve => setTimeout(resolve, 1100)) // restarts are spaced at least 1 s apart
+		t.equal(env.voiceLib.players.length, 2, "the player is restarted")
+		const second = env.voiceLib.players[1]
+		t.equal(second.resource.options.inputType, "Raw", "the new player plays a fresh raw stream")
+
+		await bridge.stop()
+		second.emit("stateChange", {status: "playing"}, {status: "idle"})
+		await new Promise(resolve => setTimeout(resolve, 1100))
+		t.equal(env.voiceLib.players.length, 2, "nothing is restarted after teardown")
 	} finally {
 		await bridge.stop()
 		env.restore()

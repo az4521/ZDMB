@@ -1,7 +1,6 @@
 // @ts-check
 const {test} = require("supertape")
 const {
-	FRAME_MS,
 	STEREO_FRAME_BYTES,
 	createOpusDecoder,
 	stereoToMono,
@@ -119,12 +118,11 @@ test("audio: createOpusDecoder decodes an Opus packet produced by OpusScript's e
 	t.ok(decoded.some(b => b !== 0), "decoded audio is not silence")
 })
 
-test("audio: LivePcmStream emits 3840-byte frames at ~20 ms cadence", async t => {
-	const stream = new LivePcmStream(() => null)
+test("audio: LivePcmStream emits 3840-byte frames on every read", async t => {
+	let n = 0
+	const stream = new LivePcmStream(() => (n++ < 2 ? Buffer.alloc(STEREO_FRAME_BYTES, 1) : null))
 	/** @type {Buffer[]} */
 	const chunks = []
-	/** @type {number[]} */
-	const times = []
 	await new Promise((resolve, reject) => {
 		const failsafe = setTimeout(() => {
 			stream.stop()
@@ -133,7 +131,6 @@ test("audio: LivePcmStream emits 3840-byte frames at ~20 ms cadence", async t =>
 		stream.on("error", reject)
 		stream.on("data", chunk => {
 			chunks.push(chunk)
-			times.push(performance.now())
 			if (chunks.length === 6) {
 				clearTimeout(failsafe)
 				stream.stop()
@@ -142,12 +139,10 @@ test("audio: LivePcmStream emits 3840-byte frames at ~20 ms cadence", async t =>
 		})
 	})
 	t.ok(chunks.every(c => c.length === STEREO_FRAME_BYTES), "every frame is 3840 bytes")
-	t.ok(chunks.every(c => c.every(b => b === 0)), "null pull yields silence")
-	const avgInterval = (times[5] - times[0]) / 5
-	t.ok(avgInterval >= FRAME_MS * 0.8 && avgInterval <= FRAME_MS * 1.5, `average interval ${avgInterval.toFixed(1)} ms is ~${FRAME_MS} ms`)
+	t.ok(chunks.slice(2).every(c => c.every(b => b === 0)), "null pulls yield silence")
 })
 
-test("audio: LivePcmStream passes pulled frames through in order", async t => {
+test("audio: LivePcmStream passes pulled frames through in order, with silence for null", async t => {
 	let n = 0
 	const stream = new LivePcmStream(() => (n < 3 ? Buffer.alloc(STEREO_FRAME_BYTES, ++n) : null))
 	/** @type {Buffer[]} */
@@ -167,11 +162,34 @@ test("audio: LivePcmStream passes pulled frames through in order", async t => {
 			}
 		})
 	})
-	t.deepEqual(chunks.map(c => c[0]), [1, 2, 3, 0])
+	t.deepEqual(chunks.slice(0, 4).map(c => c[0]), [1, 2, 3, 0])
 })
 
-test("audio: LivePcmStream stop() ends the stream", async t => {
-	const stream = new LivePcmStream(() => null)
+test("audio: LivePcmStream never produces more than its high-water mark ahead of the reader", async t => {
+	let pulls = 0
+	const stream = new LivePcmStream(() => {
+		pulls++
+		return Buffer.alloc(STEREO_FRAME_BYTES, 1)
+	})
+	// Nobody reads yet: production stops once the buffer holds four frames.
+	stream.read(0)
+	await new Promise(resolve => setTimeout(resolve, 50))
+	t.equal(pulls, 4, "four frames pulled while unread")
+	t.ok(stream.readableLength <= STEREO_FRAME_BYTES * 4, "buffer is at most the high-water mark")
+
+	// One read frees one slot, which produces exactly one more frame.
+	const frame = stream.read(STEREO_FRAME_BYTES)
+	t.equal(frame.length, STEREO_FRAME_BYTES)
+	t.equal(pulls, 5, "one more frame pulled after one read")
+	stream.stop()
+})
+
+test("audio: LivePcmStream stop() ends the stream and stops pulling", async t => {
+	let pulls = 0
+	const stream = new LivePcmStream(() => {
+		pulls++
+		return null
+	})
 	await new Promise((resolve, reject) => {
 		const failsafe = setTimeout(() => reject(new Error("stream did not end")), 2000)
 		stream.on("error", reject)
@@ -181,18 +199,24 @@ test("audio: LivePcmStream stop() ends the stream", async t => {
 		})
 		stream.on("data", () => stream.stop())
 	})
+	const pullsAtEnd = pulls
+	await new Promise(resolve => setTimeout(resolve, 50))
 	t.ok(stream.destroyed || stream.readableEnded, "stream ended")
+	t.equal(pulls, pullsAtEnd, "no frames are pulled after stop()")
 })
 
-test("audio: LivePcmStream applies backpressure when nobody reads", async t => {
-	let pulls = 0
+test("audio: LivePcmStream destroys itself with the error when pull() throws", async t => {
 	const stream = new LivePcmStream(() => {
-		pulls++
-		return null
+		throw new Error("boom")
 	})
-	// Never attach a consumer: production should stop at the high-water mark.
-	stream.read(0)
-	await new Promise(resolve => setTimeout(resolve, 200))
-	stream.stop()
-	t.ok(pulls >= 1 && pulls <= 6, `pulled ${pulls} frames while unread (expected a few)`)
+	const err = await new Promise((resolve, reject) => {
+		const failsafe = setTimeout(() => reject(new Error("no error emitted")), 2000)
+		stream.on("error", e => {
+			clearTimeout(failsafe)
+			resolve(e)
+		})
+		stream.resume()
+	})
+	t.equal(/** @type {Error} */ (err).message, "boom")
+	t.ok(stream.destroyed, "stream is destroyed")
 })
