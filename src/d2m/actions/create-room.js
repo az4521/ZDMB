@@ -1,6 +1,7 @@
 // @ts-check
 
 const assert = require("assert").strict
+const {isDeepStrictEqual} = require("util")
 const DiscordTypes = require("discord-api-types/v10")
 const Ty = require("../../types")
 const {reg} = require("../../matrix/read-registration")
@@ -42,6 +43,11 @@ const DEFAULT_PRIVACY_LEVEL = 0
 
 const READ_ONLY_ROOM_EVENTS_DEFAULT_POWER = 50
 
+const THREAD_TYPES = [DiscordTypes.ChannelType.PublicThread, DiscordTypes.ChannelType.PrivateThread, DiscordTypes.ChannelType.AnnouncementThread]
+
+/** Custom state type that tells the Zam client which room a thread belongs to. */
+const THREAD_PARENT_STATE_TYPE = "moe.crafty.zdmb.thread_parent"
+
 /** @type {Map<string, Promise<string>>} channel ID -> Promise<room ID> */
 const inflightRoomCreate = sync.remember(() => new Map())
 
@@ -71,6 +77,36 @@ function convertNameAndTopic(channel, guild, customName) {
 		 : `${maybeTopicWithNewlines}${channelIDPart}\n${guildIDPart}`;
 
 	return [chosenName, convertedTopic];
+}
+
+/**
+ * Same as threadParentContent, but for the m.space.child event in the parent space: the `via` is already on that event, so it's left out.
+ * @param {{id: string, type: number, parent_id?: string | null}} channel
+ * @returns {{room_id: string, event_id?: string} | null}
+ */
+function threadParentSpaceContent(channel) {
+	const content = threadParentContent(channel)
+	if (!content) return null
+	const {via, ...rest} = content
+	return rest
+}
+
+/**
+ * Builds the `moe.crafty.zdmb.thread_parent` state content for a thread room: the room of its parent channel,
+ * and the event of the message that started the thread (a thread started from a message has the same ID as that message).
+ * @param {{id: string, type: number, parent_id?: string | null}} channel
+ * @returns {{room_id: string, via: string[], event_id?: string} | null} null if not a thread, or its parent has no room
+ */
+function threadParentContent(channel) {
+	if (!THREAD_TYPES.includes(channel.type)) return null
+	if (!channel.parent_id) return null
+	const parentRoomID = select("channel_room", "room_id", {channel_id: channel.parent_id}).pluck().get()
+	if (!parentRoomID) return null
+	/** @type {{room_id: string, via: string[], event_id?: string}} */
+	const content = {room_id: parentRoomID, via: [reg.ooye.server_name]}
+	const starterEventID = select("event_message", "event_id", {message_id: channel.id, part: 0}).pluck().get()
+	if (starterEventID) content.event_id = starterEventID
+	return content
 }
 
 /**
@@ -194,6 +230,10 @@ async function channelToKState(channel, guild, di) {
 
 	// Don't overwrite room topic if the topic has been customised
 	if (hasCustomTopic) delete channelKState["m.room.topic/"]
+
+	// Tell the Zam client which room a thread belongs to
+	const threadParent = threadParentContent(channel)
+	if (threadParent) channelKState[`${THREAD_PARENT_STATE_TYPE}/`] = threadParent
 
 	// Make voice channels be a Matrix voice room (MSC3417)
 	if (channel.type === DiscordTypes.ChannelType.GuildVoice) {
@@ -602,7 +642,7 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 	}
 
 	const spaceKState = await ks.roomToKState(spaceID)
-	/** @type {{via?: string[], order?: string}} */
+	/** @type {{via?: string[], order?: string, "moe.crafty.zdmb.thread_parent"?: {room_id: string, event_id?: string}}} */
 	let spaceEventContent = {}
 	if (
 		channel.type !== DiscordTypes.ChannelType.PrivateThread // private threads do not belong in the space (don't offer people something they can't join)
@@ -616,6 +656,8 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 		}
 		const order = channelToSpaceOrder(channel)
 		if (typeof order === "string") spaceEventContent.order = order
+		const threadParent = threadParentSpaceContent(channel)
+		if (threadParent) spaceEventContent[THREAD_PARENT_STATE_TYPE] = threadParent
 	}
 	const spaceDiff = ks.diffKState(spaceKState, {
 		[`m.space.child/${roomID}`]: spaceEventContent
@@ -624,36 +666,97 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 }
 
 /**
- * Update the `order` of every bridged room that is already a child of the guild's space, reading the space state only once.
- * Children that were removed from the space (empty m.space.child content) are left alone, and so are spaces in self-service mode,
- * where the person who linked the rooms arranges them.
+ * Update the `order` and thread parent of every bridged room that is already a child of the guild's space (or of a forum's space), reading each space state only once.
+ * Children that were removed from the space (empty m.space.child content) are left alone. In self-service mode the person who linked the rooms
+ * arranges them, so only threads (which the bridge still puts in the space) are updated.
  * Used at startup, so that spaces bridged before ZDMB get ordered, and when a category moves, since Discord only sends
  * CHANNEL_UPDATE for the category itself and not for its children.
  * @param {string} guildID
  */
 async function syncSpaceOrder(guildID) {
-	const autocreate = select("guild_active", "autocreate", {guild_id: guildID}).pluck().get()
-	if (autocreate === 0) return
-	const spaceID = select("guild_space", "space_id", {guild_id: guildID}).pluck().get()
-	if (!spaceID) return
+	// In self-service mode the person who linked the rooms arranges them, so only threads (which the bridge still puts in the space) are updated
+	const selfService = select("guild_active", "autocreate", {guild_id: guildID}).pluck().get() === 0
+	const guildSpaceID = select("guild_space", "space_id", {guild_id: guildID}).pluck().get()
+	if (!guildSpaceID) return
 
-	const spaceKState = await ks.roomToKState(spaceID)
-	const target = {}
+	// Group the bridged children by the space they are in. Threads of forum/media channels are in the forum's room, which is a space.
+	/** @type {Map<string, {channel: any, roomID: string}[]>} */
+	const childrenBySpace = new Map()
 	const rows = select("channel_room", ["channel_id", "room_id"], {guild_id: guildID}).all()
 	for (const row of rows) {
-		const key = `m.space.child/${row.room_id}`
-		const existing = spaceKState[key]
-		if (!existing?.via) continue // not in this space, or removed from it
 		// @ts-ignore
 		const channel = discord.channels.get(row.channel_id)
 		if (!channel) continue
-		const order = channelToSpaceOrder(channel)
-		if (order === undefined || existing.order === order) continue
-		target[key] = {...existing, order}
+		if (selfService && !THREAD_TYPES.includes(channel.type)) continue
+		let spaceID = guildSpaceID
+		if (THREAD_TYPES.includes(channel.type)) {
+			// @ts-ignore
+			const parentChannel = discord.channels.get(channel.parent_id || "")
+			if (parentChannel?.type === DiscordTypes.ChannelType.GuildForum || parentChannel?.type === DiscordTypes.ChannelType.GuildMedia) {
+				spaceID = select("channel_room", "room_id", {channel_id: parentChannel.id}).pluck().get()
+				if (!spaceID) continue
+			}
+		}
+		if (!childrenBySpace.has(spaceID)) childrenBySpace.set(spaceID, [])
+		childrenBySpace.get(spaceID).push({channel, roomID: row.room_id})
 	}
-	if (!Object.keys(target).length) return
-	const spaceDiff = ks.diffKState(spaceKState, target)
-	await ks.applyKStateDiffToRoom(spaceID, spaceDiff)
+
+	for (const [spaceID, children] of childrenBySpace) {
+		const spaceKState = await ks.roomToKState(spaceID)
+		const target = {}
+		for (const {channel, roomID} of children) {
+			const key = `m.space.child/${roomID}`
+			const existing = spaceKState[key]
+			if (!existing?.via) continue // not in this space, or removed from it
+			const content = {...existing}
+			const order = channelToSpaceOrder(channel)
+			if (order !== undefined) content.order = order
+			const threadParent = threadParentSpaceContent(channel)
+			if (threadParent) content[THREAD_PARENT_STATE_TYPE] = threadParent
+			if (isDeepStrictEqual(content, existing)) continue
+			target[key] = content
+		}
+		if (!Object.keys(target).length) continue
+		const spaceDiff = ks.diffKState(spaceKState, target)
+		await ks.applyKStateDiffToRoom(spaceID, spaceDiff)
+	}
+}
+
+/**
+ * Backfill the `moe.crafty.zdmb.thread_parent` state on the bridged thread rooms of a guild, for threads bridged before this state existed.
+ * Only sends the state when it is missing or different. Each room is handled separately, so one failure doesn't stop the rest.
+ * Used at startup.
+ * @param {string} guildID
+ */
+async function syncThreadParents(guildID) {
+	const rows = select("channel_room", ["channel_id", "room_id", "thread_parent"], {guild_id: guildID}).all()
+	for (const row of rows) {
+		try {
+			// @ts-ignore
+			const cached = discord.channels.get(row.channel_id)
+			/** @type {{id: string, type: number, parent_id?: string | null} | undefined} */
+			let channel = cached
+			// Archived threads may not be cached. Only public threads store thread_parent, so that's the type to assume for them.
+			if (!cached && row.thread_parent) {
+				channel = {id: row.channel_id, type: DiscordTypes.ChannelType.PublicThread, parent_id: row.thread_parent}
+			}
+			if (!channel) continue
+
+			const content = threadParentContent(channel)
+			if (!content) continue
+
+			/** @type {any} */
+			let current = null
+			try {
+				current = await api.getStateEvent(row.room_id, THREAD_PARENT_STATE_TYPE, "")
+			} catch (e) {} // doesn't exist yet
+			if (isDeepStrictEqual(current, content)) continue
+
+			await api.sendState(row.room_id, THREAD_PARENT_STATE_TYPE, "", content)
+		} catch (e) {
+			console.error(`[thread parent sync] failed for room ${row.room_id}:`, e)
+		}
+	}
 }
 
 /**
@@ -695,5 +798,8 @@ module.exports.unbridgeChannel = unbridgeChannel
 module.exports.channelToSpaceOrder = channelToSpaceOrder
 module.exports.syncCategoryChildrenOrder = syncCategoryChildrenOrder
 module.exports.syncSpaceOrder = syncSpaceOrder
+module.exports.threadParentContent = threadParentContent
+module.exports.threadParentSpaceContent = threadParentSpaceContent
+module.exports.syncThreadParents = syncThreadParents
 module.exports.existsOrAutocreatable = existsOrAutocreatable
 module.exports.assertExistsOrAutocreatable = assertExistsOrAutocreatable

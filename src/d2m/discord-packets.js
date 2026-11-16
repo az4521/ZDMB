@@ -118,6 +118,7 @@ async function onPacket(client, message, listen) {
 				await eventDispatcher.checkMissedPins(client, message.d)
 				await eventDispatcher.checkMissedLeaves(client, message.d)
 				await eventDispatcher.checkSpaceOrder(message.d)
+				await eventDispatcher.checkThreadParents(message.d)
 			} catch (e) {
 				if (firstReady) {
 					console.error("Failed to sync missed events. To retry, please fix this error and restart ZDMB:")

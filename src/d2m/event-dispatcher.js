@@ -178,6 +178,14 @@ module.exports = {
 	},
 
 	/**
+	 * When logging back in, make sure every bridged thread room has the thread parent state, including threads bridged before it existed.
+	 * @param {DiscordTypes.GatewayGuildCreateDispatchData} guild
+	 */
+	async checkThreadParents(guild) {
+		await createRoom.syncThreadParents(guild.id)
+	},
+
+	/**
 	 * When logging back in, check if we missed any changes to emojis or stickers. Apply the changes if so.
 	 * @param {DiscordTypes.GatewayGuildCreateDispatchData} guild
 	 */
