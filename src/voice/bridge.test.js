@@ -379,10 +379,11 @@ test("voice bridge: start does nothing when voice_bridge is off", async t => {
 	}
 })
 
-test("voice bridge: a Discord human joining activates the call", async t => {
+test("voice bridge: a Discord human joining while a Matrix human is in the call bridges the media", async t => {
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
 		await bridge._idle()
 
@@ -402,6 +403,106 @@ test("voice bridge: a Discord human joining activates the call", async t => {
 		t.equal(env.publishers.length, 1)
 		t.ok(env.publishers[0].connected, "publisher connected")
 		t.equal(env.publishers[0].creds.jwt, `jwt:${simFor("555")}`)
+		t.end()
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Discord human joining with nobody in the Matrix call gets a membership, but no media", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
+		await bridge._idle()
+
+		t.equal(env.registerUser.synced.length, 1, "full profile is synced")
+		t.deepEqual(env.memberships.joins, [[ROOM, simFor("555")]], "membership joined")
+		t.equal(env.pool.acquired.length, 0, "no anchor")
+		t.equal(env.main.joins.length, 0, "anchor does not join the Discord channel")
+		t.equal(env.listeners.length, 0, "no listener")
+		t.equal(env.publishers.length, 0, "no publisher")
+		t.notOk(bridge._channelBridges.get(CHANNEL_KEY).active, "channel is not active")
+		t.end()
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Matrix human joining after a Discord human bridges the media without joining the membership again", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
+		await bridge._idle()
+		t.equal(env.pool.acquired.length, 0)
+
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
+		await bridge._idle()
+		t.equal(env.pool.acquired.length, 1, "anchor is acquired")
+		t.equal(env.main.joins.length, 1, "anchor joins the Discord channel")
+		t.equal(env.listeners.length, 1)
+		t.ok(env.listeners[0].connected, "listener connected")
+		t.equal(env.publishers.length, 1, "publisher for the existing Discord human")
+		t.ok(env.publishers[0].connected, "publisher connected")
+		t.equal(env.publishers[0].creds.jwt, `jwt:${simFor("555")}`)
+		t.deepEqual(env.memberships.joins, [[ROOM, simFor("555")]], "membership not joined twice")
+		t.equal(env.registerUser.synced.length, 1, "sim not synced twice")
+		t.end()
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: the last Matrix human leaving tears the media down but keeps Discord memberships", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
+		await bridge._idle()
+		const listener = env.listeners[0]
+
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, {}))
+		await bridge._idle()
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		t.notOk(cb.active, "channel is not active")
+		t.ok(listener.closed, "listener closed")
+		t.ok(env.publishers[0].closed, "Discord human's publisher closed")
+		t.equal(cb.publishers.size, 0)
+		t.equal(env.pool.released.length, 1, "anchor released")
+		t.equal(env.pool.released[0].bot, env.main)
+		t.deepEqual(env.memberships.leaves, [], "Discord membership kept")
+		t.deepEqual(env.memberships.joins, [[ROOM, simFor("555")]], "membership not rejoined")
+
+		// Media comes back when a Matrix human rejoins, with a new publisher but no new membership
+		bridge.onMatrixCallMemberEvent(callEvent(BOB, JOIN_CONTENT))
+		await bridge._idle()
+		t.ok(cb.active, "media bridged again")
+		t.equal(env.publishers.length, 2, "a fresh publisher for the Discord human")
+		t.deepEqual(env.memberships.joins, [[ROOM, simFor("555")]], "still one membership join")
+		t.end()
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Discord human leaving with nobody in the Matrix call leaves their membership", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
+		await bridge._idle()
+		bridge.onDiscordVoiceState(voiceState("555", null))
+		await bridge._idle()
+
+		t.deepEqual(env.memberships.leaves, [[ROOM, simFor("555")]], "membership left")
+		t.equal(env.publishers.length, 0)
+		t.equal(env.pool.acquired.length, 0)
 		t.end()
 	} finally {
 		await bridge.stop()
@@ -435,6 +536,7 @@ test("voice bridge: a Matrix human joining activates the call, and leaving deact
 		t.equal(env.pool.acquired.length, 1)
 		t.equal(env.listeners.length, 1)
 		t.ok(env.listeners[0].connected)
+		t.equal(env.main.joins.length, 1, "anchor joins the Discord channel so Discord users can see the call")
 		t.equal(env.publishers.length, 0, "no Discord humans, so no publishers")
 
 		bridge.onMatrixCallMemberEvent(callEvent(ALICE, {}))
@@ -551,6 +653,7 @@ test("voice bridge: a Discord human leaving closes their publisher and membershi
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
 		bridge.onDiscordVoiceState(voiceState("556", CHANNEL))
 		await bridge._idle()
@@ -646,6 +749,8 @@ test("voice bridge: moving between bridged channels leaves one and joins the oth
 		await bridge.start()
 		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
 		await bridge._idle()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT, ROOM2)) // someone is in the stage's Matrix call
+		await bridge._idle()
 		bridge.onDiscordVoiceState(voiceState("555", STAGE))
 		await bridge._idle()
 
@@ -679,6 +784,7 @@ test("voice bridge: speech from a Discord human is decoded and pushed to their p
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
 		await bridge._idle()
 
@@ -724,6 +830,7 @@ test("voice bridge: stop tears everything down and ignores later events", async 
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState("555", CHANNEL))
 		await bridge._idle()
 		await bridge.stop()
@@ -783,9 +890,10 @@ test("voice bridge: a Discord soundboard sound is uploaded once and sent as a pa
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
 		await bridge._idle()
-		const effect = {guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111", sound_volume: 1}
+		const effect ={guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111", sound_volume: 1}
 		bridge.onDiscordSoundboard(effect)
 		bridge.onDiscordSoundboard(effect)
 		await bridge._idle()
@@ -806,6 +914,7 @@ test("voice bridge: a Discord soundboard sound from someone without a publisher 
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
 		await bridge._idle()
 		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: "777", sound_id: "111"})
@@ -825,6 +934,7 @@ test("voice bridge: a soundboard effect sent by our own bot is not bridged again
 	console.log = (...args) => { logged.push(args.join(" ")) }
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
 		await bridge._idle()
 
@@ -856,6 +966,7 @@ test("voice bridge: Discord effects without a sound, and sounds in channels that
 		await bridge._idle()
 		t.equal(env.media.uploads.length, 0, "a channel with nobody in it is not active")
 
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
 		await bridge._idle()
 		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, emoji: {name: "wave"}})
@@ -864,6 +975,29 @@ test("voice bridge: Discord effects without a sound, and sounds in channels that
 		t.equal(env.media.uploads.length, 0, "emoji-only effects and text channels are ignored")
 		t.equal(env.listeners[0].dataPackets.length, 0)
 	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: a Discord soundboard sound with nobody in the Matrix call is skipped and logged", async t => {
+	const env = makeEnv()
+	const logged = /** @type {string[]} */ ([])
+	const realLog = console.log
+	console.log = (...args) => { logged.push(args.join(" ")) }
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.media.uploads.length, 0, "nothing is uploaded")
+		t.equal(env.publishers.length, 0)
+		t.equal(env.listeners.length, 0)
+		t.ok(logged.some(l => l.includes("[soundboard] not bridged: nobody is in the Matrix call")), "the skip is logged")
+		t.end()
+	} finally {
+		console.log = realLog
 		await bridge.stop()
 		env.restore()
 	}
@@ -1099,6 +1233,7 @@ test("voice bridge: a player that goes Idle while its channel is active is start
 	const env = makeEnv()
 	try {
 		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(ALICE, JOIN_CONTENT))
 		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
 		await bridge._idle()
 		const [first] = env.voiceLib.players

@@ -42,7 +42,7 @@ Bridged voice channels can be bridged live to Matrix calls (MatrixRTC with a Liv
 
 * Each Discord speaker joins the Matrix call as their own bridged account, with their own audio track.
 * Matrix speakers are played into Discord by bots. Each Matrix speaker gets their own "puppet" bot (nicknamed after them) while there are free ones; anyone beyond that is mixed through the main bot.
-* A channel is bridged while anyone is in it on either side, and the bots leave when everyone has.
+* Audio is only bridged while someone is in the Matrix call: the bots stay out of a Discord voice channel that only has Discord users in it. Those users still appear in the Matrix call as members, so you can see who's there before joining. The bots leave once the Matrix call is empty.
 * Soundboard sounds are bridged both ways (Zam's MSC4577 soundboard). Sounds played on Discord play for Zam users as coming from that person. Sounds played in Zam that came from a Discord server's soundboard play as real Discord soundboard sounds (needs the Use Soundboard permission, and Use External Sounds for other servers' sounds); any other sound is decoded with `ffmpeg` and mixed into that person's Discord audio.
 
 It's off by default. To turn it on, add to the `ooye` section of `registration.yaml`:

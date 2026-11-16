@@ -3,13 +3,14 @@
 /*
 	Voice bridge orchestrator.
 
-	One ChannelBridge per bridged Discord voice or stage channel (a channel_room row). A ChannelBridge is active while
-	at least one human is present on either side:
+	One ChannelBridge per bridged Discord voice or stage channel (a channel_room row).
 
-	- Discord humans: each gets a ghost sim joined to the Matrix call, a LiveKit publisher, and a membership.
-	  The anchor bot in the Discord channel receives their speech and feeds it to their publisher.
-	- Matrix humans: the bridge bot listens to their LiveKit microphone tracks. Each track gets a dedicated puppet
-	  if one is free, otherwise it is mixed into the anchor bot's output.
+	- Discord humans: each one in the Discord channel gets a ghost sim joined to the Matrix call (a membership), whether or
+	  not anyone is in the Matrix call, so that Matrix clients can see who is in the Discord voice channel.
+	- Media is bridged only while at least one Matrix human is in the call. Then the anchor bot joins the Discord channel,
+	  the bridge bot listens to LiveKit, each Discord human gets a publisher, and speech flows both ways. Each Matrix
+	  microphone track gets a dedicated puppet if one is free, otherwise it is mixed into the anchor bot's output.
+	  When the last Matrix human leaves, the media is torn down but the Discord humans' memberships are kept.
 
 	Changes to a channel's humans and connections run through that channel's promise queue, so overlapping events can't race.
 	Collaborators are read through `_deps` so that tests can replace them. Native voice libraries are only required
@@ -392,7 +393,9 @@ class ChannelBridge {
 		this.discordMembers = new Map()
 		/** @type {Set<string>} Matrix mxids that are in the call (ours excluded) */
 		this.matrixHumans = new Set()
-		/** @type {Map<string, PublisherEntry>} Discord user ID to their ghost publisher */
+		/** @type {Map<string, string>} Discord user ID to the sim mxid joined to the Matrix call for them */
+		this.memberships = new Map()
+		/** @type {Map<string, PublisherEntry>} Discord user ID to their ghost publisher. Only while media is bridged. */
 		this.publishers = new Map()
 		/** @type {Map<string, {stream: any}>} Discord user ID to their live Opus subscription */
 		this.speakers = new Map()
@@ -516,19 +519,33 @@ class ChannelBridge {
 	}
 
 	/**
-	 * Brings the channel in line with its humans. Only run from the queue.
+	 * Brings the channel in line with its humans. Media is bridged only while a Matrix human is in the call. Discord
+	 * humans get their memberships whenever they are in the Discord channel. Only run from the queue.
 	 */
 	async reconcile() {
-		const wanted = this.discordHumans.size + this.matrixHumans.size > 0
-		if (!wanted) {
+		if (this.discordHumans.size + this.matrixHumans.size === 0) {
+			if (this.active) console.log(`[voice] ${this.channelID}: nobody is left, media bridging stopped`)
 			await this.teardown()
 			return
 		}
-		if (!this.active) {
-			const activated = await this.activate()
-			if (!activated) return
+		if (this.matrixHumans.size === 0) {
+			if (this.active) {
+				console.log(`[voice] ${this.channelID}: Matrix call is empty, media bridging stopped`)
+				await this.teardownMedia()
+			} else if (!this.loggedWaitingForMatrix) {
+				// Only once per wait, since this runs on every Discord voice state update
+				this.loggedWaitingForMatrix = true
+				console.log(`[voice] ${this.channelID}: Matrix call is empty, media not bridged`)
+			}
+		} else {
+			this.loggedWaitingForMatrix = false
+			if (!this.active) {
+				const activated = await this.activate()
+				if (activated) console.log(`[voice] ${this.channelID}: media bridging started`)
+			}
 		}
-		await this.syncDiscordHumans()
+		await this.syncMemberships()
+		if (this.active) await this.syncPublishers()
 	}
 
 	/**
@@ -583,15 +600,24 @@ class ChannelBridge {
 			return true
 		} catch (e) {
 			console.error(`[voice] could not start bridging channel ${this.channelID}:`, e)
-			await this.teardown()
+			await this.teardownMedia()
 			return false
 		}
 	}
 
 	/**
-	 * Undoes whatever activate() set up. Safe to call when nothing is active. Only run from the queue.
+	 * Forgets every Discord human's membership in the Matrix call. Only run from the queue, after the humans are gone.
 	 */
 	async teardown() {
+		await this.teardownMedia()
+		for (const userID of [...this.memberships.keys()]) await this.leaveDiscordHuman(userID)
+	}
+
+	/**
+	 * Undoes whatever activate() and the publishers set up. Keeps the Discord humans' memberships. Safe to call when
+	 * nothing is active. Only run from the queue.
+	 */
+	async teardownMedia() {
 		const {anchor, connection, onStart, anchorPlayback, listener} = this
 		this.active = false
 		this.stopStatsTimer()
@@ -610,7 +636,7 @@ class ChannelBridge {
 			}
 		}
 		for (const userID of [...this.speakers.keys()]) this.stopSpeaker(userID)
-		for (const userID of [...this.publishers.keys()]) await this.teardownDiscordHuman(userID)
+		for (const userID of [...this.publishers.keys()]) await this.closePublisher(userID)
 		for (const participant of [...this.participants.values()]) await this.endParticipant(participant)
 
 		if (connection && onStart) connection.receiver?.speaking?.off?.("start", onStart)
@@ -619,22 +645,23 @@ class ChannelBridge {
 	}
 
 	/**
-	 * Makes publishers match the Discord humans. Only run from the queue.
+	 * Makes memberships match the Discord humans. Needs no anchor or LiveKit. Only run from the queue.
 	 */
-	async syncDiscordHumans() {
-		for (const userID of [...this.publishers.keys()]) {
-			if (!this.discordHumans.has(userID)) await this.teardownDiscordHuman(userID)
+	async syncMemberships() {
+		for (const userID of [...this.memberships.keys()]) {
+			if (!this.discordHumans.has(userID)) await this.leaveDiscordHuman(userID)
 		}
 		for (const userID of [...this.discordHumans.keys()]) {
-			if (!this.publishers.has(userID)) await this.setupDiscordHuman(userID)
+			if (!this.memberships.has(userID)) await this.joinDiscordHuman(userID)
 		}
 	}
 
 	/**
-	 * Gives a Discord human a sim in the room, a membership, and a publisher. Failures are logged. Only run from the queue.
+	 * Gives a Discord human a sim in the room and a membership in the Matrix call. Failures are logged, and the next
+	 * reconcile tries again. Only run from the queue.
 	 * @param {string} userID
 	 */
-	async setupDiscordHuman(userID) {
+	async joinDiscordHuman(userID) {
 		const user = this.discordHumans.get(userID)
 		const member = this.discordMembers.get(userID)
 		const rtc = _deps.matrixRTC()
@@ -654,7 +681,44 @@ class ChannelBridge {
 				mxid = await _deps.registerUser().ensureSimJoined(user, this.roomID)
 			}
 			await rtc.memberships.join(this.roomID, mxid)
-			const credentials = await rtc.getLiveKitCredentials(mxid, this.roomID)
+			this.memberships.set(userID, mxid)
+		} catch (e) {
+			console.error(`[voice] could not join Discord user ${userID} to the call in ${this.roomID}:`, e)
+			if (mxid) await rtc.memberships.leave(this.roomID, mxid)
+		}
+	}
+
+	/**
+	 * Closes a Discord human's publisher, if any, and removes their membership. Only run from the queue.
+	 * @param {string} userID
+	 */
+	async leaveDiscordHuman(userID) {
+		await this.closePublisher(userID)
+		const mxid = this.memberships.get(userID)
+		if (!mxid) return
+		this.memberships.delete(userID)
+		await _deps.matrixRTC().memberships.leave(this.roomID, mxid)
+	}
+
+	/**
+	 * Gives every Discord human with a membership a publisher, if they don't have one. Only while media is bridged.
+	 * Only run from the queue.
+	 */
+	async syncPublishers() {
+		for (const userID of [...this.discordHumans.keys()]) {
+			if (!this.publishers.has(userID) && this.memberships.has(userID)) await this.connectPublisher(userID)
+		}
+	}
+
+	/**
+	 * Connects a LiveKit publisher for a Discord human's existing membership. Failures are logged. Only run from the queue.
+	 * @param {string} userID
+	 */
+	async connectPublisher(userID) {
+		const mxid = this.memberships.get(userID)
+		if (!mxid) return
+		try {
+			const credentials = await _deps.matrixRTC().getLiveKitCredentials(mxid, this.roomID)
 			const publisher = new (_deps.livekit().Publisher)(credentials)
 			try {
 				await publisher.connect()
@@ -664,15 +728,15 @@ class ChannelBridge {
 			}
 			this.publishers.set(userID, {publisher, mxid, decoder: null})
 		} catch (e) {
-			console.error(`[voice] could not bridge Discord user ${userID} into ${this.roomID}:`, e)
-			if (mxid) await rtc.memberships.leave(this.roomID, mxid)
+			console.error(`[voice] could not connect a publisher for Discord user ${userID} into ${this.roomID}:`, e)
 		}
 	}
 
 	/**
+	 * Closes a Discord human's publisher and stops their speech. Keeps their membership.
 	 * @param {string} userID
 	 */
-	async teardownDiscordHuman(userID) {
+	async closePublisher(userID) {
 		const entry = this.publishers.get(userID)
 		if (!entry) return
 		this.publishers.delete(userID)
@@ -682,7 +746,6 @@ class ChannelBridge {
 		} catch (e) {
 			console.error(`[voice] failed to close publisher for ${userID}:`, e)
 		}
-		await _deps.matrixRTC().memberships.leave(this.roomID, entry.mxid)
 	}
 
 	/**
@@ -1152,7 +1215,7 @@ async function handleDiscordSoundboard(data) {
 		return
 	}
 	if (!bridge.active) {
-		console.log(`[soundboard] not bridged: sound ${soundID} was played in ${where}, whose bridge is not active`)
+		console.log(`[soundboard] not bridged: nobody is in the Matrix call (sound ${soundID} in ${where})`)
 		return
 	}
 	if (!bridge.listener) {
