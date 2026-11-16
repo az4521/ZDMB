@@ -4,14 +4,12 @@ const passthrough = require("../../passthrough")
 const {sync, db, select, from} = passthrough
 /** @type {import("../../matrix/api")} */
 const api = sync.require("../../matrix/api")
-/** @type {import("./speedbump")} */
-const speedbump = sync.require("./speedbump")
 
 /**
  * @param {import("discord-api-types/v10").GatewayMessageDeleteDispatchData} data
  */
 async function deleteMessage(data) {
-	const row = select("channel_room", ["room_id", "speedbump_checked", "thread_parent"], {channel_id: data.channel_id}).get()
+	const row = select("channel_room", "room_id", {channel_id: data.channel_id}).get()
 	if (!row) return
 
 	// Assume we can redact from tombstoned rooms.
@@ -22,8 +20,6 @@ async function deleteMessage(data) {
 		// Unfortunately, we can't specify a sender to do the redaction as, unless we find out that info via the audit logs
 		await api.redactEvent(room_id, event_id)
 	}
-
-	await speedbump.updateCache(row.thread_parent || data.channel_id, row.speedbump_checked)
 }
 
 /**

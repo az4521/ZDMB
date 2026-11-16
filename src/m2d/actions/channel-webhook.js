@@ -26,7 +26,7 @@ async function ensureWebhook(channelID, forceCreate = false) {
 	}
 
 	// If we got here, we need to create a new webhook.
-	const webhook = await discord.snow.webhook.createWebhook(channelID, {name: "Out Of Your Element: Matrix Bridge"})
+	const webhook = await discord.snow.webhook.createWebhook(channelID, {name: "ZDMB: Matrix Bridge"})
 	assert(webhook.token)
 	db.prepare("REPLACE INTO webhook (channel_id, webhook_id, webhook_token) VALUES (?, ?, ?)").run(channelID, webhook.id, webhook.token)
 	return {

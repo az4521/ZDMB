@@ -1,13 +1,14 @@
 // @ts-check
 
 const mixin = require("@cloudrac3r/mixin-deep")
-const {channelToKState, _convertNameAndTopic} = require("./create-room")
+const {channelToKState, _convertNameAndTopic, channelToSpaceOrder, syncSpaceOrder} = require("./create-room")
+const api = require("../../matrix/api")
 const {kstateStripConditionals} = require("../../matrix/kstate")
 const {test} = require("supertape")
 const testData = require("../../../test/data")
 
 const passthrough = require("../../passthrough")
-const {db} = passthrough
+const {db, discord} = passthrough
 
 function mockAPI(t) {
 	let called = 0
@@ -200,6 +201,11 @@ test("channel2room: voice channel", async t => {
 		"m.name": "🍞丨[8user] Piece",
 		"m.type": "m.voice"
 	})
+	// anybody can join calls
+	const events = state["m.room.power_levels/"].events
+	t.equal(events["org.matrix.msc3401.call.member"], 0)
+	t.equal(events["m.call.member"], 0)
+	t.equal(events["m.rtc.member"], 0)
 })
 
 test("convertNameAndTopic: custom name and topic", t => {
@@ -249,4 +255,154 @@ test("convertNameAndTopic: voice channel icon", t => {
 		_convertNameAndTopic({id: "123", name: "the-twilight-zone", topic: "Spooky stuff here. :ghost:", type: 2}, {id: "456"}, null),
 		["[🔊] the-twilight-zone", "Spooky stuff here. :ghost:\n\nChannel ID: 123\nGuild ID: 456"]
 	)
+})
+
+/** Temporarily puts channels in the Discord cache while the callback runs. */
+function withCachedChannels(channels, callback) {
+	for (const channel of channels) discord.channels.set(channel.id, channel)
+	try {
+		return callback()
+	} finally {
+		for (const channel of channels) discord.channels.delete(channel.id)
+	}
+}
+
+const orderCategory = {id: "700000000000000001", type: 4, position: 3, name: "Category"} // GuildCategory, so its children are shown at position 4
+
+test("channelToSpaceOrder: uncategorised text channel sorts before categorised channels", t => {
+	const uncategorised = {id: "112760669178241024", type: 0, position: 0, parent_id: null}
+	t.equal(channelToSpaceOrder(uncategorised), "0000" + "0" + "0000" + "00112760669178241024")
+	withCachedChannels([orderCategory], () => {
+		const categorised = {id: "700000000000000011", type: 0, position: 0, parent_id: orderCategory.id}
+		t.ok(channelToSpaceOrder(uncategorised) < channelToSpaceOrder(categorised))
+	})
+})
+
+test("channelToSpaceOrder: text channels come before voice channels in the same category", t => {
+	withCachedChannels([orderCategory], () => {
+		const text = {id: "700000000000000011", type: 0, position: 5, parent_id: orderCategory.id}
+		const voice = {id: "700000000000000012", type: 2, position: 0, parent_id: orderCategory.id}
+		const textOrder = channelToSpaceOrder(text)
+		const voiceOrder = channelToSpaceOrder(voice)
+		t.equal(textOrder, "0004" + "0" + "0005" + "00700000000000000011")
+		t.equal(voiceOrder, "0004" + "1" + "0000" + "00700000000000000012")
+		t.ok(textOrder < voiceOrder)
+	})
+})
+
+test("channelToSpaceOrder: channel position within category", t => {
+	withCachedChannels([orderCategory], () => {
+		const first = {id: "700000000000000011", type: 0, position: 9, parent_id: orderCategory.id}
+		const second = {id: "700000000000000012", type: 0, position: 10, parent_id: orderCategory.id}
+		t.ok(channelToSpaceOrder(first) < channelToSpaceOrder(second), "position 9 sorts before position 10")
+	})
+})
+
+test("channelToSpaceOrder: thread sorts after its parent and before the next channel", t => {
+	withCachedChannels([orderCategory], () => {
+		const parent = {id: "700000000000000011", type: 0, position: 5, parent_id: orderCategory.id}
+		const thread = {id: "700000000000000013", type: 11, parent_id: parent.id} // PublicThread
+		const next = {id: "700000000000000014", type: 0, position: 6, parent_id: orderCategory.id}
+		withCachedChannels([parent], () => {
+			const parentOrder = channelToSpaceOrder(parent)
+			const threadOrder = channelToSpaceOrder(thread)
+			const nextOrder = channelToSpaceOrder(next)
+			t.equal(threadOrder, parentOrder + "00700000000000000013")
+			t.ok(parentOrder < threadOrder)
+			t.ok(threadOrder < nextOrder)
+		})
+	})
+})
+
+test("channelToSpaceOrder: thread whose parent is not cached has no order", t => {
+	const thread = {id: "700000000000000013", type: 11, parent_id: "700000000000000099"}
+	t.equal(channelToSpaceOrder(thread), undefined)
+})
+
+test("channelToSpaceOrder: forum and media threads have no order", t => {
+	const forum = {id: "700000000000000021", type: 15, position: 0, parent_id: null} // GuildForum
+	const media = {id: "700000000000000022", type: 16, position: 0, parent_id: null} // GuildMedia
+	withCachedChannels([forum, media], () => {
+		t.equal(channelToSpaceOrder({id: "700000000000000031", type: 11, parent_id: forum.id}), undefined)
+		t.equal(channelToSpaceOrder({id: "700000000000000032", type: 11, parent_id: media.id}), undefined)
+	})
+})
+
+test("syncSpaceOrder: fills in a missing order, leaves correct and removed children alone", async t => {
+	const guildID = "999000000000000003"
+	const spaceID = "!syncorderspace:cadence.moe"
+	const category = {id: "700000000000000101", type: 4, position: 3, name: "Category", guild_id: guildID}
+	const chanA = {id: "700000000000000111", type: 0, position: 1, parent_id: category.id, guild_id: guildID, name: "a"}
+	const chanB = {id: "700000000000000112", type: 0, position: 2, parent_id: category.id, guild_id: guildID, name: "b"}
+	const chanD = {id: "700000000000000113", type: 0, position: 3, parent_id: category.id, guild_id: guildID, name: "d"}
+	const roomA = "!roomA:cadence.moe"
+	const roomB = "!roomB:cadence.moe"
+	const roomD = "!roomD:cadence.moe"
+	const orderA = "0004" + "0" + "0001" + "00700000000000000111"
+	const orderB = "0004" + "0" + "0002" + "00700000000000000112"
+
+	const realGetAllState = api.getAllState
+	const realSendState = api.sendState
+	const sent = []
+	db.prepare("INSERT INTO guild_active (guild_id, autocreate) VALUES (?, 1)").run(guildID)
+	db.prepare("INSERT INTO guild_space (guild_id, space_id, presence, privacy_level) VALUES (?, ?, 0, 0)").run(guildID, spaceID)
+	const insertRoom = db.prepare("INSERT INTO channel_room (channel_id, room_id, name, nick, thread_parent, guild_id) VALUES (?, ?, ?, NULL, NULL, ?)")
+	insertRoom.run(chanA.id, roomA, "a", guildID)
+	insertRoom.run(chanB.id, roomB, "b", guildID)
+	insertRoom.run(chanD.id, roomD, "d", guildID)
+	discord.channels.set(category.id, category)
+	discord.channels.set(chanA.id, chanA)
+	discord.channels.set(chanB.id, chanB)
+	discord.channels.set(chanD.id, chanD)
+	try {
+		// @ts-ignore
+		api.getAllState = async roomID => {
+			t.equal(roomID, spaceID)
+			return [
+				// A: in the space with via, but no order yet
+				{type: "m.space.child", state_key: roomA, content: {via: ["cadence.moe"]}},
+				// B: in the space with the correct order already
+				{type: "m.space.child", state_key: roomB, content: {via: ["cadence.moe"], order: orderB}},
+				// D: removed from the space (empty content)
+				{type: "m.space.child", state_key: roomD, content: {}}
+			]
+		}
+		// @ts-ignore
+		api.sendState = async (roomID, type, stateKey, content) => {
+			sent.push({roomID, type, stateKey, content})
+			return "$event"
+		}
+
+		await syncSpaceOrder(guildID)
+
+		t.deepEqual(sent, [{
+			roomID: spaceID,
+			type: "m.space.child",
+			stateKey: roomA,
+			content: {via: ["cadence.moe"], order: orderA}
+		}])
+	} finally {
+		api.getAllState = realGetAllState
+		api.sendState = realSendState
+		for (const channel of [category, chanA, chanB, chanD]) discord.channels.delete(channel.id)
+		db.prepare("DELETE FROM channel_room WHERE guild_id = ?").run(guildID)
+		db.prepare("DELETE FROM guild_space WHERE guild_id = ?").run(guildID)
+		db.prepare("DELETE FROM guild_active WHERE guild_id = ?").run(guildID)
+	}
+})
+
+test("channelToSpaceOrder: order strings are at most 50 characters", t => {
+	withCachedChannels([orderCategory], () => {
+		const channel = {id: "12345678901234567890", type: 2, position: 9999, parent_id: orderCategory.id}
+		const order = channelToSpaceOrder(channel)
+		t.ok(order)
+		t.ok(order.length <= 50)
+		const parent = {id: "12345678901234567890", type: 0, position: 9999, parent_id: orderCategory.id}
+		withCachedChannels([parent], () => {
+			const thread = {id: "12345678901234567891", type: 11, parent_id: parent.id}
+			const threadOrder = channelToSpaceOrder(thread)
+			t.ok(threadOrder)
+			t.ok(threadOrder.length <= 50)
+		})
+	})
 })

@@ -24,9 +24,10 @@ const discordTime = sync.require("../../discord/time")
 const findMentions = sync.require("./find-mentions")
 /** @type {import("../../discord/interactions/poll-responses")} */
 const pollResponses = sync.require("../../discord/interactions/poll-responses")
-/** @type {import("../actions/speedbump")} */
-const speedbump = sync.require("../actions/speedbump")
 const {reg} = require("../../matrix/read-registration")
+
+/** Attachment msgtypes that can be items of a gallery message. */
+const GALLERY_ITEM_MSGTYPES = ["m.image", "m.video", "m.audio", "m.file"]
 
 /**
  * @param {DiscordTypes.APIMessage} message
@@ -478,47 +479,6 @@ async function messageToEvent(message, guild, options = {}, di) {
 		} else if (message.referenced_message) {
 			repliedToUnknownEvent = true
 		}
-	} else if (message.type === DiscordTypes.MessageType.ContextMenuCommand && message.interaction && message.message_reference?.message_id) {
-		// It could be a /plu/ral emulated reply
-		if (message.interaction.name.startsWith("Reply ") && message.content.startsWith("-# [↪](")) {
-			const row = await getHistoricalEventRow(message.message_reference?.message_id)
-			if (row && "event_id" in row) {
-				repliedToEventRow = Object.assign(row, {channel_id: row.reference_channel_id})
-				message.content = message.content.replace(/^.*\n/, "")
-				isInteraction = false // declutter
-			}
-		}
-	} else if (dUtils.isWebhookMessage(message) && message.embeds[0]?.author?.name?.endsWith("↩️")) {
-		// It could be a PluralKit emulated reply, let's see if it has a message link
-		const isEmulatedReplyToText = message.embeds[0].description?.startsWith("**[Reply to:]")
-		const isEmulatedReplyToAttachment = message.embeds[0].description?.startsWith("*[(click to see attachment")
-		if (isEmulatedReplyToText || isEmulatedReplyToAttachment) {
-			assert(message.embeds[0].description)
-			const match = message.embeds[0].description.match(/\/channels\/[0-9]*\/[0-9]*\/([0-9]{2,})/)
-			if (match) {
-				const row = await getHistoricalEventRow(match[1])
-				if (row && "event_id" in row) {
-					/*
-						we generate a partial referenced_message based on what PK provided. we don't need everything, since this will only be used for further message-to-event converting.
-						the following properties are necessary:
-						- content: used for generating the reply fallback
-						- author: used for the top of the reply fallback (only used for discord authors. for matrix authors, repliedToEventSenderMxid is set.)
-					*/
-					const emulatedMessageContent =
-						( isEmulatedReplyToAttachment ? "[Media]"
-						: message.embeds[0].description.replace(/^.*?\)\*\*\s*/, ""))
-					message.referenced_message = {
-						content: emulatedMessageContent,
-						// @ts-ignore
-						author: {
-							username: message.embeds[0].author.name.replace(/\s{,3}↩️\s*$/, "")
-						}
-					}
-					message.embeds.shift()
-					repliedToEventRow = Object.assign(row, {channel_id: row.reference_channel_id})
-				}
-			}
-		}
 	}
 	if (repliedToEventRow && repliedToEventRow.source === 0) { // reply was originally from Matrix
 		// Need to figure out who sent that event...
@@ -615,9 +575,8 @@ async function messageToEvent(message, guild, options = {}, di) {
 		content = await transformContentMessageLinks(content)
 
 		// Remove smalltext from non-bots (I don't like it).
-		const isHumanOrDataMissing = !message.author?.bot
-		const isProxyOrHumanOrDataMissing = message.webhook_id ? speedbump.sentByProxyWebhook(message) : isHumanOrDataMissing
-		if (isProxyOrHumanOrDataMissing) {
+		const isHumanOrDataMissing = !message.webhook_id && !message.author?.bot
+		if (isHumanOrDataMissing) {
 			content = content.replaceAll(/^-# +([([])?([^\n].*?)/gm, "$1...$2")
 		}
 
@@ -970,10 +929,50 @@ async function messageToEvent(message, guild, options = {}, di) {
 	// Then attachments
 	if (message.attachments) {
 		const attachmentEvents = await Promise.all(message.attachments.map(attachment => attachmentToEvent(mentions, attachment, false, {fetch: di?.fetch})))
+		const mediaEvents = attachmentEvents.filter(e => GALLERY_ITEM_MSGTYPES.includes(e.msgtype))
 
-		// Try to merge attachment events with the previous event
-		// This means that if the attachments ended up as a text link, and especially if there were many of them, the events will be joined together.
-		mergeTextEvents(attachmentEvents, events, false)
+		if ((reg.ooye.gallery_messages ?? true) && mediaEvents.length >= 2) {
+			// Text links (spoilers, too-large files) are still merged into the text as usual.
+			mergeTextEvents(attachmentEvents.filter(e => !GALLERY_ITEM_MSGTYPES.includes(e.msgtype)), events, false)
+
+			// The text of the Discord message becomes the gallery caption, if it is the only event so far.
+			/** @type {any} */
+			let caption = {}
+			if (events.length === 1 && events[0].$type === "m.room.message" && events[0].msgtype === "m.text") {
+				caption = events.shift()
+			}
+
+			/** @type {any[]} */
+			const itemtypes = mediaEvents.map(ev => {
+				const item = {...ev}
+				delete item.$type
+				delete item["m.mentions"]
+				const itemtype = item.msgtype
+				delete item.msgtype
+				return {itemtype, ...item}
+			})
+
+			/** @type {any} */
+			const gallery = {
+				$type: "m.room.message",
+				"m.mentions": caption["m.mentions"] || mentions,
+				msgtype: "dm.filament.gallery",
+				body: caption.body || "",
+				itemtypes
+			}
+			if (caption.formatted_body !== undefined) {
+				gallery.format = caption.format
+				gallery.formatted_body = caption.formatted_body
+			}
+			if (caption["m.url_previews"] !== undefined) {
+				gallery["m.url_previews"] = caption["m.url_previews"]
+			}
+			events.push(gallery)
+		} else {
+			// Try to merge attachment events with the previous event
+			// This means that if the attachments ended up as a text link, and especially if there were many of them, the events will be joined together.
+			mergeTextEvents(attachmentEvents, events, false)
+		}
 	}
 
 	// Then components
@@ -1298,7 +1297,7 @@ async function messageToEvent(message, guild, options = {}, di) {
 	// Strip formatted_body where equivalent to body
 	if (!options.alwaysReturnFormattedBody) {
 		for (const event of events) {
-			if (event.$type === "m.room.message" && "msgtype" in event && ["m.text", "m.notice"].includes(event.msgtype) && event.body === event.formatted_body) {
+			if (event.$type === "m.room.message" && "msgtype" in event && ["m.text", "m.notice", "dm.filament.gallery"].includes(event.msgtype) && event.body === event.formatted_body) {
 				delete event.format
 				delete event.formatted_body
 			}

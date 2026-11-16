@@ -1,7 +1,7 @@
 {
-  "name": "out-of-your-element",
+  "name": "zdmb",
   "version": "3.8.1",
-  "description": "A bridge between Matrix and Discord",
+  "description": "Zam Discord-Matrix Bridge: a fork of Out Of Your Element, a bridge between Matrix and Discord",
   "main": "index.js",
   "repository": {
     "type": "git",

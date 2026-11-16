@@ -27,8 +27,6 @@ const updatePins = sync.require("./actions/update-pins")
 const api = sync.require("../matrix/api")
 /** @type {import("../discord/utils")} */
 const dUtils = sync.require("../discord/utils")
-/** @type {import("./actions/speedbump")} */
-const speedbump = sync.require("./actions/speedbump")
 /** @type {import("./actions/retrigger")} */
 const retrigger = sync.require("./actions/retrigger")
 /** @type {import("./actions/set-presence")} */
@@ -170,6 +168,14 @@ module.exports = {
 	},
 
 	/**
+	 * When logging back in, make sure the rooms in the space are in the same order as the Discord channel list.
+	 * @param {DiscordTypes.GatewayGuildCreateDispatchData} guild
+	 */
+	async checkSpaceOrder(guild) {
+		await createRoom.syncSpaceOrder(guild.id)
+	},
+
+	/**
 	 * When logging back in, check if we missed any changes to emojis or stickers. Apply the changes if so.
 	 * @param {DiscordTypes.GatewayGuildCreateDispatchData} guild
 	 */
@@ -255,6 +261,11 @@ module.exports = {
 	 * @param {DiscordTypes.GatewayChannelUpdateDispatchData} channelOrThread
 	 */
 	async CHANNEL_UPDATE(client, channelOrThread) {
+		// Categories have no room of their own, but moving one changes the order of its children in the space
+		if (channelOrThread.type === DiscordTypes.ChannelType.GuildCategory) {
+			await createRoom.syncCategoryChildrenOrder(channelOrThread.id)
+			return
+		}
 		const roomID = select("channel_room", "room_id", {channel_id: channelOrThread.id}).pluck().get()
 		if (!roomID) return // No target room to update the data on
 		await createRoom.syncRoom(channelOrThread.id)
@@ -313,9 +324,6 @@ module.exports = {
 
 		if (!createRoom.existsOrAutocreatable(channel, guild.id)) return // Check that the sending-to room exists or is autocreatable
 
-		const {skip} = await speedbump.maybeDoSpeedbump(true, message)
-		if (skip) return
-
 		await sendMessage.sendMessage(message, channel, guild)
 
 		retrigger.finishedBridging(message.id)
@@ -333,10 +341,6 @@ module.exports = {
 
 		if (dUtils.isEphemeralMessage(data)) return // Ephemeral messages are for the eyes of the receiver only!
 
-		// Edits need to go through the speedbump as well. If the message is delayed but the edit isn't, we don't have anything to edit from.
-		const {skip, hasCreate} = await speedbump.maybeDoSpeedbump(false, data)
-		if (skip) return
-
 		/** @type {DiscordTypes.GatewayMessageCreateDispatchData} */
 		const message = data
 		const channel = client.channels.get(message.channel_id)
@@ -344,17 +348,9 @@ module.exports = {
 		const guild = client.guilds.get(channel.guild_id)
 		assert(guild)
 
-		if (!hasCreate) {
-			// Standard path for most message updates
-			// Check that the target message already exists, and deal with Eventual Consistency(TM)
-			if (!await retrigger.waitForMessage(data.id)) return
-			await retrigger.pauseChanges(message.id, editMessage.editMessage(message, guild))
-		}
-		else {
-			// Path for edit packets that were speedbumped into the latest copy of a message that needs to be created
-			// Just pretend to be MESSAGE_CREATE
-			await sendMessage.sendMessage(message, channel, guild)
-		}
+		// Check that the target message already exists, and deal with Eventual Consistency(TM)
+		if (!await retrigger.waitForMessage(data.id)) return
+		await retrigger.pauseChanges(message.id, editMessage.editMessage(message, guild))
 	},
 
 	/**
@@ -399,7 +395,6 @@ module.exports = {
 	 * @param {DiscordTypes.GatewayMessageDeleteDispatchData} data
 	 */
 	async MESSAGE_DELETE(client, data) {
-		speedbump.onMessageDelete(data.id)
 		if (!await retrigger.waitForMessage(data.id)) return
 		await deleteMessage.deleteMessage(data)
 	},
@@ -465,6 +460,6 @@ module.exports = {
 	PRESENCE_UPDATE(client, data) {
 		const status = data.status
 		if (!status) return
-		setPresence.presenceTracker.incomingPresence(data.user.id, data.guild_id, status)
+		setPresence.presenceTracker.incomingPresence(data.user.id, data.guild_id, status, data.activities)
 	}
 }

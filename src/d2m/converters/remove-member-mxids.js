@@ -11,8 +11,6 @@ function removeMemberMxids(userID, guildID) {
 	// Get sims for user and remove
 	let membership = from("sim").join("sim_member", "mxid").join("channel_room", "room_id")
 		.select("room_id", "mxid").where({user_id: userID, guild_id: guildID}).and("ORDER BY room_id, mxid").all()
-	membership = membership.concat(from("sim_proxy").join("sim", "user_id").join("sim_member", "mxid").join("channel_room", "room_id")
-		.select("room_id", "mxid").where({proxy_owner_id: userID, guild_id: guildID}).and("ORDER BY room_id, mxid").all())
 
 	// Get user installed apps and remove
 	/** @type {string[]} */

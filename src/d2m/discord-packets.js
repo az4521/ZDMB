@@ -100,7 +100,7 @@ async function onPacket(client, message, listen) {
 					process.stdout.write(`Connecting to homeserver... `)
 					// await guildReadyStatus.waitForAllReady() - no need, we already checked this is the last guild
 					await homeserverStatus.homeserverStatus.waitForOnline(true)
-					console.log("ok.\nReplaying past events. Welcome to Out Of Your Element.")
+					console.log("ok.\nReplaying past events. Welcome to ZDMB.")
 				} else {
 					await guildReadyStatus.waitForAllReady()
 					await homeserverStatus.homeserverStatus.waitForOnline(false)
@@ -110,9 +110,10 @@ async function onPacket(client, message, listen) {
 				await eventDispatcher.checkMissedMessages(client, message.d)
 				await eventDispatcher.checkMissedPins(client, message.d)
 				await eventDispatcher.checkMissedLeaves(client, message.d)
+				await eventDispatcher.checkSpaceOrder(message.d)
 			} catch (e) {
 				if (firstReady) {
-					console.error("Failed to sync missed events. To retry, please fix this error and restart OOYE:")
+					console.error("Failed to sync missed events. To retry, please fix this error and restart ZDMB:")
 				}
 				console.error(e)
 			}

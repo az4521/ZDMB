@@ -20,7 +20,6 @@ const PREAPPROVED_ORIGINS = new Set([
 	"https://cadence.moe",
 	"https://cdn.discordapp.com",
 	"https://cdn.modrinth.com",
-	"https://cdn.pluralkit.me",
 	"https://cdn.tupperbox.app",
 	"https://codeberg.org",
 	"https://files.catbox.moe",

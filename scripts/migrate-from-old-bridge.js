@@ -125,5 +125,5 @@ async function migrateGuild(guild) {
 
 	// Step 5: Call syncSpace to make sure everything is up to date
 	await createSpace.syncSpace(guild)
-	console.log(`Finished migrating ${guild.name} to Out Of Your Element`)
+	console.log(`Finished migrating ${guild.name} to ZDMB`)
 }

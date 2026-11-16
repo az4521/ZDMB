@@ -111,6 +111,30 @@ async function userToGlobalProfile(user) {
 }
 
 /**
+ * Get the colour Discord shows for a member: the colour of their highest-positioned role that has a non-zero colour.
+ * Ties on position are broken by the higher role ID.
+ * @param {Omit<DiscordTypes.APIGuildMember, "user"> | undefined} member
+ * @param {{id: string, color: number, position: number, colors?: {primary_color: number}}[] | undefined} roles
+ * @returns {string | null} lowercase "#rrggbb", or null if the member has no coloured role
+ */
+function memberToColor(member, roles) {
+	if (!member || !roles) return null
+	const memberRoleIDs = new Set(member.roles)
+	/** @type {{id: string, position: number, color: number} | null} */
+	let best = null
+	for (const role of roles) {
+		if (!memberRoleIDs.has(role.id)) continue
+		const color = role.colors?.primary_color ?? role.color
+		if (!color) continue
+		if (!best || role.position > best.position || (role.position === best.position && BigInt(role.id) > BigInt(best.id))) {
+			best = {id: role.id, position: role.position, color}
+		}
+	}
+	if (!best) return null
+	return "#" + best.color.toString(16).padStart(6, "0")
+}
+
+/**
  * @param {DiscordTypes.APIUser} user
  * @param {Omit<DiscordTypes.APIGuildMember, "user"> | undefined} member
  * @param {string} guildID
@@ -120,6 +144,10 @@ async function memberToStateContent(user, member, guildID) {
 	let displayname = user.username
 	if (user.global_name) displayname = user.global_name
 	if (member?.nick) displayname = member.nick
+
+	/** @type {DiscordTypes.APIRole[] | undefined} */ // @ts-ignore
+	const roles = discord.guilds.get(guildID)?.roles
+	const colour = memberToColor(member, roles)
 
 	const content = {
 		displayname,
@@ -139,6 +167,11 @@ async function memberToStateContent(user, member, guildID) {
 	if (avatarPath) {
 		content["moe.cadence.ooye.member"].avatar = avatarPath
 		content.avatar_url = await file.uploadDiscordFileToMxc(avatarPath)
+	}
+
+	// Role colour, in the format read by the Zam client (MSC4522)
+	if (colour) {
+		content["eu.she-a.color"] = {on_dark: colour, on_light: colour}
 	}
 
 	return content
@@ -223,10 +256,14 @@ async function syncUser(user, member, channel, guild, roomID, interactionMetadat
 	const mxid = await ensureSimJoined(user, roomID)
 	const content = await memberToStateContent(user, member, guild.id)
 	const powerLevel = memberToPowerLevel(user, member, guild, channel)
+	const colour = memberToColor(member, guild.roles)
 	await _sendSyncUser(roomID, mxid, content, powerLevel, {
 		// do not overwrite pre-existing data if we already have data and `member` is not accessible, because this would replace good data with bad data
 		allowOverwrite: !!member,
-		globalProfile: await userToGlobalProfile(user)
+		globalProfile: {
+			...await userToGlobalProfile(user),
+			"eu.she-a.color": colour ? {on_dark: colour, on_light: colour} : null
+		}
 	})
 
 	const appInstalledByUser = user.bot && interactionMetadata?.authorizing_integration_owners?.[DiscordTypes.ApplicationIntegrationType.UserInstall]
@@ -242,7 +279,7 @@ async function syncUser(user, member, channel, guild, roomID, interactionMetadat
  * @param {string} mxid
  * @param {{displayname: string, avatar_url?: string}} content
  * @param {number | null} powerLevel
- * @param {{allowOverwrite?: boolean, globalProfile?: {displayname: string, avatar_url?: string}}} [options]
+ * @param {{allowOverwrite?: boolean, globalProfile?: {displayname: string, avatar_url?: string, "eu.she-a.color"?: {on_dark: string, on_light: string} | null}}} [options]
  */
 async function _sendSyncUser(roomID, mxid, content, powerLevel, options) {
 	const currentHash = _hashProfileContent(content, powerLevel ?? 0)
@@ -264,6 +301,10 @@ async function _sendSyncUser(roomID, mxid, content, powerLevel, options) {
 		if (await supportsMsc4069) {
 			actions.push(api.profileSetDisplayname(mxid, options?.globalProfile?.displayname || content.displayname, true))
 			actions.push(api.profileSetAvatarUrl(mxid, options?.globalProfile?.avatar_url || content.avatar_url, true))
+		}
+		// Update role colour in global profile (null deletes the field). Failure is ignored, because not all servers support extended profile fields.
+		if (options?.globalProfile && Object.prototype.hasOwnProperty.call(options.globalProfile, "eu.she-a.color")) {
+			actions.push(api.profileSetField(mxid, "eu.she-a.color", options.globalProfile["eu.she-a.color"]).catch(() => {}))
 		}
 		await Promise.all(actions)
 		// Update cached hash
@@ -301,6 +342,7 @@ async function syncAllUsersInRoom(roomID) {
 }
 
 module.exports._memberToStateContent = memberToStateContent
+module.exports.memberToColor = memberToColor
 module.exports._hashProfileContent = _hashProfileContent
 module.exports.ensureSim = ensureSim
 module.exports.ensureSimJoined = ensureSimJoined

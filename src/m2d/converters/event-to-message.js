@@ -124,12 +124,8 @@ turndownService.addRule("inlineLink", {
 	replacement: function (content, node) {
 		if (node.getAttribute("data-user-id")) {
 			const user_id = node.getAttribute("data-user-id")
-			const row = select("sim_proxy", ["displayname", "proxy_owner_id"], {user_id}).get()
-			if (row) {
-				return `**@${row.displayname}** (<@${row.proxy_owner_id}>)`
-			} else {
-				return `<@${user_id}>`
-			}
+			if (!user_id.match(/^[0-9]+$/)) return `**@${content.replace(/^>/, "")}**` // not a real Discord user, e.g. a proxy member left over from OOYE's PluralKit support
+			return `<@${user_id}>`
 		}
 		if (node.getAttribute("data-message-id")) return `https://discord.com/channels/${node.getAttribute("data-guild-id")}/${node.getAttribute("data-channel-id")}/${node.getAttribute("data-message-id")}`
 		if (node.getAttribute("data-channel-id")) return `<#${node.getAttribute("data-channel-id")}>`
@@ -332,14 +328,15 @@ function splitDisplayName(displayName) {
 }
 
 /**
- * Convert a Matrix user ID into a Discord user ID for mentioning, where if the user is a PK proxy, it will mention the proxy owner.
+ * Convert a Matrix user ID into a Discord mention.
+ * Sims that don't belong to a real Discord user (webhooks, and proxy members left over from OOYE's PluralKit support) are written as bold text.
  * @param {string} mxid
  */
 function getUserOrProxyOwnerMention(mxid) {
-	const row = from("sim").join("sim_proxy", "user_id", "left").select("user_id", "username", "proxy_owner_id").where({mxid}).get()
+	const row = select("sim", ["user_id", "username"], {mxid}).get()
 	if (!row) return null
-	if (userToMxid.isWebhookUserID(row.user_id)) return `**@${row.username}**`
-	return `<@${row.proxy_owner_id || row.user_id}>`
+	if (!row.user_id.match(/^[0-9]+$/)) return `**@${row.username}**`
+	return `<@${row.user_id}>`
 }
 
 /**
@@ -501,8 +498,21 @@ const attachmentEmojis = new Map([
 	["m.image", "🖼️"],
 	["m.video", "🎞️"],
 	["m.audio", "🎶"],
-	["m.file", "📄"]
+	["m.file", "📄"],
+	["dm.filament.gallery", "🖼️"],
+	["m.gallery", "🖼️"]
 ])
+
+/** The item types a gallery may contain, which are the same as the file message types. */
+const galleryItemTypes = ["m.image", "m.video", "m.audio", "m.file"]
+
+/**
+ * @param {any} item
+ * @returns {boolean} whether the item is one of the supported gallery item types and has a file to upload
+ */
+function isGalleryItem(item) {
+	return !!item && typeof item === "object" && galleryItemTypes.includes(item.itemtype) && (typeof item.url === "string" || "file" in item)
+}
 
 /** @param {DiscordTypes.APIGuild} guild */
 function getFileSizeForGuild(guild) {
@@ -512,6 +522,60 @@ function getFileSizeForGuild(guild) {
 		return fileSizeFeature * 1024 * 1024 // discord uses big megabytes
 	} else {
 		return 20 * 1024 * 1024 // default file size is 20 MB
+	}
+}
+
+/**
+ * Adds one file as an attachment to the message. If the file is too large for the guild, adds a link to the caption instead.
+ * Used for the file of a single file message, and for each item of a gallery message.
+ * @param {any} content the file's content. For a gallery item, this is the item, which has the same keys as file content.
+ * @param {string} msgtype the msgtype of a file message, or the itemtype of a gallery item
+ * @param {DiscordTypes.APIGuild} guild
+ * @param {mxUtils.MatrixStringBuilder} captionContent will be modified
+ * @param {{id: string, filename: string}[]} attachments will be modified
+ * @param {any[]} pendingFiles will be modified
+ */
+function addFileToMessage(content, msgtype, guild, captionContent, attachments, pendingFiles) {
+	// Spoiler message
+	const fileIsSpoiler = content["page.codeberg.everypizza.msc4193.spoiler"] || content["town.robin.msc3725.content_warning"]
+	const fileSpoilerReason = content["page.codeberg.everypizza.msc4193.spoiler.reason"] || content["town.robin.msc3725.content_warning"]?.description
+	if (fileIsSpoiler && typeof fileSpoilerReason === "string") {
+		captionContent.addLine(`(Spoiler: ${fileSpoilerReason})`)
+	}
+
+	// If filename is not specified, create one from mimetype
+	let filename = content.filename || content.body
+	if (!filename) {
+		const extension = mimeTypes.extension(content.info?.mimetype)
+		assert(extension, "Filename and mimetype missing. Please report this bug to your client.")
+		filename = `file.${extension}`
+	}
+
+	// File link as alternative to uploading
+	if (!("file" in content) && content.info?.size > getFileSizeForGuild(guild)) {
+		// Upload (unencrypted) file as link, because it's too large for Discord
+		// Do this by constructing a sample Matrix message with the link and then use the text processor to convert that + the original caption.
+		const url = mxUtils.getPublicUrlForMxc(content.url)
+		assert(url)
+		const emoji = attachmentEmojis.has(msgtype) ? attachmentEmojis.get(msgtype) + " " : ""
+		if (fileIsSpoiler) {
+			captionContent.addLine(`${emoji}Uploaded SPOILER file: <${url}> (${pb(content.info.size)})`, tag`${emoji}<em>Uploaded <strong>SPOILER</strong> file: <span data-mx-spoiler><a href="${url} ">${filename}</a></span> (${pb(content.info.size)})</em>`) // the space is necessary to work around a bug in Discord's URL previewer. the preview still gets blurred in the client.
+		} else {
+			captionContent.addLine(`${emoji}Uploaded file: ${url} (${pb(content.info.size)})`, tag`${emoji}<em>Uploaded file: <a href="${url}">${filename}</a> (${pb(content.info.size)})</em>`)
+		}
+	} else {
+		// Upload file as file
+		if (fileIsSpoiler) filename = "SPOILER_" + filename
+		if ("file" in content) {
+			// Encrypted
+			assert.equal(content.file.key.alg, "A256CTR")
+			attachments.push({id: "0", filename})
+			pendingFiles.push({name: filename, mxc: content.file.url, key: content.file.key.k, iv: content.file.iv})
+		} else {
+			// Unencrypted
+			attachments.push({id: "0", filename})
+			pendingFiles.push({name: filename, mxc: content.url})
+		}
 	}
 }
 
@@ -633,8 +697,6 @@ async function eventToMessage(event, guild, channel, di) {
 	let shouldProcessTextEvent = event.type === "m.room.message" && (event.content.msgtype === "m.text" || event.content.msgtype === "m.emote")
 	if (event.type === "m.room.message" && (event.content.msgtype === "m.file" || event.content.msgtype === "m.video" || event.content.msgtype === "m.audio" || event.content.msgtype === "m.image")) {
 		// Build message content in addition to the uploaded file
-		const fileIsSpoiler = event.content["page.codeberg.everypizza.msc4193.spoiler"] || event.content["town.robin.msc3725.content_warning"]
-		const fileSpoilerReason = event.content["page.codeberg.everypizza.msc4193.spoiler.reason"] || event.content["town.robin.msc3725.content_warning"]?.description
 		content = ""
 		const captionContent = new mxUtils.MatrixStringBuilder()
 
@@ -644,45 +706,7 @@ async function eventToMessage(event, guild, channel, di) {
 			captionContent.addLine(event.content.body || "", event.content.formatted_body || tag`${event.content.body || ""}`)
 		}
 
-		// Spoiler message
-		if (fileIsSpoiler && typeof fileSpoilerReason === "string") {
-			captionContent.addLine(`(Spoiler: ${fileSpoilerReason})`)
-		}
-
-		// If filename is not specified, create one from mimetype
-		let filename = event.content.filename || event.content.body
-		if (!filename) {
-			const extension = mimeTypes.extension(event.content.info?.mimetype)
-			assert(extension, "Filename and mimetype missing. Please report this bug to your client.")
-			filename = `file.${extension}`
-		}
-
-		// File link as alternative to uploading
-		if (!("file" in event.content) && event.content.info?.size > getFileSizeForGuild(guild)) {
-			// Upload (unencrypted) file as link, because it's too large for Discord
-			// Do this by constructing a sample Matrix message with the link and then use the text processor to convert that + the original caption.
-			const url = mxUtils.getPublicUrlForMxc(event.content.url)
-			assert(url)
-			const emoji = attachmentEmojis.has(event.content.msgtype) ? attachmentEmojis.get(event.content.msgtype) + " " : ""
-			if (fileIsSpoiler) {
-				captionContent.addLine(`${emoji}Uploaded SPOILER file: <${url}> (${pb(event.content.info.size)})`, tag`${emoji}<em>Uploaded <strong>SPOILER</strong> file: <span data-mx-spoiler><a href="${url} ">${filename}</a></span> (${pb(event.content.info.size)})</em>`) // the space is necessary to work around a bug in Discord's URL previewer. the preview still gets blurred in the client.
-			} else {
-				captionContent.addLine(`${emoji}Uploaded file: ${url} (${pb(event.content.info.size)})`, tag`${emoji}<em>Uploaded file: <a href="${url}">${filename}</a> (${pb(event.content.info.size)})</em>`)
-			}
-		} else {
-			// Upload file as file
-			if (fileIsSpoiler) filename = "SPOILER_" + filename
-			if ("file" in event.content) {
-				// Encrypted
-				assert.equal(event.content.file.key.alg, "A256CTR")
-				attachments.push({id: "0", filename})
-				pendingFiles.push({name: filename, mxc: event.content.file.url, key: event.content.file.key.k, iv: event.content.file.iv})
-			} else {
-				// Unencrypted
-				attachments.push({id: "0", filename})
-				pendingFiles.push({name: filename, mxc: event.content.url})
-			}
-		}
+		addFileToMessage(event.content, event.content.msgtype, guild, captionContent, attachments, pendingFiles)
 
 		// Add result to content
 		const result = captionContent.get()
@@ -877,6 +901,27 @@ async function eventToMessage(event, guild, channel, di) {
 			}
 			replyLine = `-# > ${replyLine}${contentPreview}\n`
 		})()
+
+		// Gallery of files. Each item is uploaded as an attachment, and the gallery's own body is the caption.
+		// This is after the edit handling, so the content here is the new content of an edit.
+		if (event.type === "m.room.message" && (event.content.msgtype === "dm.filament.gallery" || event.content.msgtype === "m.gallery")) {
+			content = ""
+			const captionContent = new mxUtils.MatrixStringBuilder()
+			if (event.content.body || event.content.formatted_body) {
+				captionContent.addLine(event.content.body || "", event.content.formatted_body || tag`${event.content.body || ""}`)
+			}
+
+			const items = Array.isArray(event.content.itemtypes) ? event.content.itemtypes : []
+			for (const item of items.filter(isGalleryItem)) {
+				addFileToMessage(item, item.itemtype, guild, captionContent, attachments, pendingFiles)
+			}
+
+			const result = captionContent.get()
+			if (result.body) {
+				Object.assign(event.content, {body: result.body, format: result.format, formatted_body: result.formatted_body})
+				shouldProcessTextEvent = true
+			}
+		}
 
 		if (shouldProcessTextEvent) {
 			if (event.content.format === "org.matrix.custom.html" && event.content.formatted_body) {
@@ -1139,7 +1184,6 @@ async function eventToMessage(event, guild, channel, di) {
 			for (const mxid of event.content["m.mentions"].user_ids) {
 				let user_id = select("sim", "user_id", {mxid}).pluck().get()
 				if (!user_id) continue // only for discord users
-				user_id = select("sim_proxy", "proxy_owner_id", {user_id}).pluck().get() || user_id // convert to sim proxy owner's ID
 				if (!user_id.match(/^[0-9]+$/)) continue // mentioned sim does not have a real discord user ID (i.e. it's a webhook)
 				allowedMentionsUsers.push(user_id)
 			}
@@ -1166,9 +1210,20 @@ async function eventToMessage(event, guild, channel, di) {
 			username: displayNameShortened,
 			avatar_url: avatarURL
 		})
-		messages[0].attachments = attachments
-		// @ts-ignore these will be converted to real files when the message is about to be sent
-		messages[0].pendingFiles = pendingFiles
+		// Discord allows 10 attachments per message. Files beyond the first 10 go in additional messages with no text.
+		for (let i = 0; i < attachments.length; i += 10) {
+			/** @type {any} */
+			const target = i === 0 ? messages[0] : {
+				content: "",
+				username: displayNameShortened,
+				avatar_url: avatarURL
+			}
+			if (i > 0) messages.push(target)
+			// Attachment IDs are the index within each message
+			target.attachments = attachments.slice(i, i + 10).map((attachment, j) => ({id: String(j), filename: attachment.filename}))
+			// @ts-ignore these will be converted to real files when the message is about to be sent
+			target.pendingFiles = pendingFiles.slice(i, i + 10)
+		}
 	}
 
 	if (pollMessages.length) {

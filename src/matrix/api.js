@@ -449,6 +449,23 @@ async function profileSetAvatarUrl(mxid, avatar_url, inhibitPropagate) {
 	}
 }
 
+/**
+ * Set or delete an arbitrary profile field (MSC4133 / Matrix v1.16 extended profiles).
+ * Only call this for sims; the field is set as the sim by the appservice.
+ * @param {string} mxid
+ * @param {string} key profile field name, e.g. "eu.she-a.color"
+ * @param {any} value JSON value to set, or null/undefined to delete the field
+ */
+async function profileSetField(mxid, key, value) {
+	if (value == null) {
+		await mreq.mreq("DELETE", path(route`/client/v3/profile/${mxid}/${key}`, mxid))
+	} else {
+		await mreq.mreq("PUT", path(route`/client/v3/profile/${mxid}/${key}`, mxid), {
+			[key]: value
+		})
+	}
+}
+
 async function ping() {
 	// not using mreq so that we can read the status code
 	const res = await fetch(mreq.baseUrl + route`/client/v1/appservice/${reg.id}/ping`, {
@@ -673,6 +690,7 @@ module.exports.redactEvent = redactEvent
 module.exports.sendTyping = sendTyping
 module.exports.profileSetDisplayname = profileSetDisplayname
 module.exports.profileSetAvatarUrl = profileSetAvatarUrl
+module.exports.profileSetField = profileSetField
 module.exports.ping = ping
 module.exports.previewUrlIfEnabled = previewUrlIfEnabled
 module.exports.getMedia = getMedia

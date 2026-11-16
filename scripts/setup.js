@@ -73,7 +73,7 @@ async function validateHomeserverOrigin(serverUrlPrompt, url) {
 
 function defineEchoHandler() {
 	return defineEventHandler(event => {
-		return "Out Of Your Element is listening.\n" +
+		return "ZDMB is listening.\n" +
 			`Received a ${event.method} request on path ${event.path}\n`
 	})
 }
@@ -135,7 +135,7 @@ function defineEchoHandler() {
 					const res = await fetch(url)
 					if (res.status !== 200) return `Server returned status code ${res.status}`
 					const text = await res.text()
-					if (!text.startsWith("Out Of Your Element is listening.")) return `Server does not point to OOYE`
+					if (!text.startsWith("ZDMB is listening.")) return `Server does not point to ZDMB`
 					return true
 				} catch (e) {
 					return e.message
@@ -201,9 +201,9 @@ function defineEchoHandler() {
 			message: "Choose a simple password (optional)"
 		})
 
-		console.log("To fulfill license obligations, I recommend mentioning Out Of Your Element in your Discord bot's profile.")
+		console.log("To fulfill license obligations, I recommend mentioning ZDMB (and Out Of Your Element, which it is based on) in your Discord bot's profile.")
 		console.log("On the Discord bot configuration page, go to General and add something like this to the description:")
-		console.log(cyan("Powered by **Out Of Your Element**"))
+		console.log(cyan("Powered by **ZDMB**, based on Out Of Your Element"))
 		console.log(cyan("https://gitdab.com/cadence/out-of-your-element"))
 		await prompt({
 			type: "invisible",
@@ -212,10 +212,10 @@ function defineEchoHandler() {
 			validate: async () => {
 				process.stdout.write(magenta("checking, please wait..."))
 				client = await snow.requestHandler.request(`/applications/@me`, {}, "get", "json")
-				if (client.description?.match(/out.of.your.element/i)) {
+				if (client.description?.match(/zdmb|out.of.your.element/i)) {
 					return true
 				} else {
-					return "Description must name or link Out Of Your Element"
+					return "Description must name or link ZDMB or Out Of Your Element"
 				}
 			}
 		})
@@ -364,10 +364,10 @@ function defineEchoHandler() {
 
 	// set profile data on homeserver...
 	console.log("⏩ Updating Matrix profile... (If you've joined lots of rooms, this is slow. Please allow at least 30 seconds.)")
-	await api.profileSetDisplayname(mxid, "Out Of Your Element (bot)")
+	await api.profileSetDisplayname(mxid, "ZDMB (bot)")
 	await api.profileSetAvatarUrl(mxid, avatarUrl)
 	console.log("✅ Matrix profile updated...")
 
-	console.log("Good to go. I hope you enjoy Out Of Your Element.")
+	console.log("Good to go. I hope you enjoy ZDMB.")
 	process.exit()
 })()

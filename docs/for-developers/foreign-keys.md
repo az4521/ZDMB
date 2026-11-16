@@ -69,8 +69,6 @@ Here are some tables that could potentially have foreign keys added between them
 * `delete-message.js`
 	* Removed redundant DELETEs
 * `edit-message.js` — `DELETE FROM event_message`
-* `register-pk-user.js` — `DELETE FROM sim`
-	* It's a failsafe during creation
 * `register-user.js` — `DELETE FROM sim`
 	* It's a failsafe during creation
 * `remove-reaction.js` — `DELETE FROM reaction`

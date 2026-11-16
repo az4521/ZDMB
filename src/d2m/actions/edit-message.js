@@ -5,8 +5,8 @@ const {sync, db, select, from} = passthrough
 const {reg} = require("../../matrix/read-registration")
 /** @type {import("../converters/edit-to-changes")} */
 const editToChanges = sync.require("../converters/edit-to-changes")
-/** @type {import("./speedbump")} */
-const speedbump = sync.require("./speedbump")
+/** @type {import("./webhook-sender")} */
+const webhookSender = sync.require("./webhook-sender")
 /** @type {import("../../matrix/api")} */
 const api = sync.require("../../matrix/api")
 /** @type {import("../../matrix/mreq")} */
@@ -29,7 +29,7 @@ async function editMessage(message, guild) {
 
 	// Sync proxy user profile (if sent by proxy)
 	if (dUtils.isWebhookMessage(message)) {
-		senderMxid = await speedbump.getWebhookSenderId(message, guild.id, roomID)
+		senderMxid = await webhookSender.getWebhookSenderId(message, guild.id, roomID)
 	}
 
 	// 1. Replace all the things.

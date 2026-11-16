@@ -12,8 +12,8 @@ const dUtils = sync.require("../../discord/utils")
 const mxUtils = sync.require("../../matrix/utils")
 
 function eventCanBeEdited(ev) {
-	// Discord does not allow files, images, attachments, or videos to be edited.
-	if (ev.old.event_type === "m.room.message" && ev.old.event_subtype !== "m.text" && ev.old.event_subtype !== "m.emote" && ev.old.event_subtype !== "m.notice") {
+	// Discord does not allow files, images, attachments, or videos to be edited. Galleries are the exception, since their caption can be edited.
+	if (ev.old.event_type === "m.room.message" && ev.old.event_subtype !== "m.text" && ev.old.event_subtype !== "m.emote" && ev.old.event_subtype !== "m.notice" && ev.old.event_subtype !== "dm.filament.gallery") {
 		return false
 	}
 	// Discord does not allow stickers to be edited.
@@ -30,6 +30,71 @@ function eventCanBeEdited(ev) {
 
 function eventIsText(ev) {
 	return ev.old.event_type === "m.room.message" && (ev.old.event_subtype === "m.text" || ev.old.event_subtype === "m.notice")
+}
+
+function eventIsGallery(ev) {
+	return ev.old.event_type === "m.room.message" && ev.old.event_subtype === "dm.filament.gallery"
+}
+
+/**
+ * @param {any} content
+ * @returns {(string | undefined)[]} the media URL of each gallery item, in order
+ */
+function galleryItemURLs(content) {
+	return (content.itemtypes || []).map((/** @type {any} */ item) => item?.url || item?.file?.url)
+}
+
+/**
+ * Messages bridged before galleries existed were separate events: a text event, then one event per attachment.
+ * Converts a gallery event into those separate events, so they can be paired with the old events.
+ * @param {any} gallery
+ * @param {boolean} hasCaption
+ * @returns {any[]}
+ */
+function galleryToLegacyEvents(gallery, hasCaption) {
+	/** @type {any[]} */
+	const events = []
+	if (hasCaption) {
+		const caption = {
+			$type: "m.room.message",
+			"m.mentions": gallery["m.mentions"],
+			msgtype: "m.text",
+			body: gallery.body
+		}
+		if (gallery.formatted_body !== undefined) {
+			caption.format = gallery.format
+			caption.formatted_body = gallery.formatted_body
+		}
+		if (gallery["m.url_previews"] !== undefined) {
+			caption["m.url_previews"] = gallery["m.url_previews"]
+		}
+		events.push(caption)
+	}
+	for (const item of gallery.itemtypes) {
+		const {itemtype, ...rest} = item
+		events.push({
+			$type: "m.room.message",
+			...rest,
+			msgtype: itemtype,
+			"m.mentions": {}
+		})
+	}
+	return events
+}
+
+/**
+ * Replaces every gallery in the new events with the legacy events, in both the fallback and inner versions, keeping them the same length.
+ * @param {any[]} newFallbackContent
+ * @param {any[]} newInnerContent
+ */
+function expandGalleriesToLegacyEvents(newFallbackContent, newInnerContent) {
+	for (let i = newInnerContent.length; i--;) { // move backwards so the indexes stay valid
+		if (newInnerContent[i].msgtype !== "dm.filament.gallery") continue
+		// The old text event only existed if there was text, so only make a caption if the message has some text.
+		const hasCaption = newInnerContent[i].body !== ""
+		newFallbackContent.splice(i, 1, ...galleryToLegacyEvents(newFallbackContent[i], hasCaption))
+		newInnerContent.splice(i, 1, ...galleryToLegacyEvents(newInnerContent[i], hasCaption))
+	}
 }
 
 /**
@@ -72,6 +137,11 @@ async function editToChanges(message, guild, api) {
 	const newFallbackContent = await messageToEvent.messageToEvent(message, guild, {includeEditFallbackStar: true}, {api, fetch})
 	const newInnerContent = await messageToEvent.messageToEvent(message, guild, {includeReplyFallback: false}, {api, fetch})
 	assert.ok(newFallbackContent.length === newInnerContent.length)
+
+	// If the old version has no gallery, it was bridged before galleries existed, so present the new gallery in the old shape to match the old events.
+	if (!oldEventRows.some(r => r.event_subtype === "dm.filament.gallery")) {
+		expandGalleriesToLegacyEvents(newFallbackContent, newInnerContent)
+	}
 
 	// Match the new events to the old events
 
@@ -173,11 +243,13 @@ async function editToChanges(message, guild, api) {
 	// Only way to detect this is by text content. So we'll remove text events from eventsToReplace that have the same new text as text currently in the event.
 	for (let i = eventsToReplace.length; i--;) { // move backwards through array
 		const event = eventsToReplace[i]
-		if (!eventIsText(event)) continue // not text, can't analyse
+		if (!eventIsText(event) && !eventIsGallery(event)) continue // not text or gallery, can't analyse
 		const oldEvent = await api.getEvent(roomID, eventsToReplace[i].old.event_id)
 		eventsToReplace[i].oldMentions = oldEvent.content["m.mentions"]
 		const oldEventBodyWithoutQuotedReply = oldEvent.content.body?.replace(/^(>.*\n)*\n*/sm, "")
 		if (oldEventBodyWithoutQuotedReply !== event.newInnerContent.body) continue // event changed, must replace it
+		// A gallery's caption may be unchanged, but its items can't be changed by Discord, so it must have the same items as well to be unchanged.
+		if (eventIsGallery(event) && JSON.stringify(galleryItemURLs(oldEvent.content)) !== JSON.stringify(galleryItemURLs(event.newInnerContent))) continue
 		// Move it from eventsToRedact to unchangedEvents.
 		unchangedEvents.push(...eventsToReplace.filter(ev => ev.old.event_id === event.old.event_id))
 		eventsToReplace = eventsToReplace.filter(ev => ev.old.event_id !== event.old.event_id)

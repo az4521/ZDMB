@@ -58,7 +58,7 @@ async function createSpace(guild, kstate) {
 	})
 	const roomID = roomCreate.room_id
 
-	db.prepare("INSERT INTO guild_space (guild_id, space_id, presence) VALUES (?, ?, ?)").run(guild.id, roomID, enablePresenceByDefault)
+	db.prepare("INSERT INTO guild_space (guild_id, space_id, presence, privacy_level) VALUES (?, ?, ?, ?)").run(guild.id, roomID, enablePresenceByDefault, createRoom.DEFAULT_PRIVACY_LEVEL)
 	return roomID
 }
 

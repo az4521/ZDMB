@@ -36,8 +36,9 @@ export type AppServiceRegistrationConfig = {
 		web_password: string
 		time_zone?: string
 		receive_presences: boolean
-		plu_ral_api_key?: string
 		bridge_admin_contact?: string
+		/** Whether multiple media attachments are bridged as one MSC4274 gallery message. Defaults to true. */
+		gallery_messages?: boolean
 	}
 	old_bridge?: {
 		as_token: string
@@ -85,67 +86,6 @@ export type WebhookAuthor = {
 	username: string
 	avatar: string | null
 	id: string
-}
-
-export type PkSystem = {
-	id: string
-	uuid: string
-	name: string | null
-	description: string | null
-	tag: string | null
-	pronouns: string | null
-	avatar_url: string | null
-	banner: string | null
-	color: string | null
-	created: string | null
-}
-
-export type PkMember = {
-	id: string
-	uuid: string
-	name: string
-	display_name: string | null
-	color: string | null
-	birthday: string | null
-	pronouns: string | null
-	avatar_url: string | null
-	webhook_avatar_url: string | null
-	banner: string | null
-	description: string | null
-	created: string | null
-	keep_proxy: boolean
-	tts: boolean
-	autoproxy_enabled: boolean | null
-	message_count: number | null
-	last_message_timestamp: string
-}
-
-export type PkMessage = {
-	system: PkSystem
-	member: PkMember
-	sender: string
-}
-
-export type PluRalWebhookMessage = {
-	original_id: string | null
-	proxy_id: string
-	author_id: string
-	channel_id: string
-	member_id: string
-	reason: string
-	webhook_id: string
-	member: PluRalMember
-}
-
-export type PluRalMember = {
-	id: string
-	name: string
-	pronouns: string
-	bio: string
-	birthday: string
-	color: number | null
-	avatar_url: string
-	private: boolean
 }
 
 export namespace Event {

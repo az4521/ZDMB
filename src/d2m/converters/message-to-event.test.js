@@ -1227,6 +1227,153 @@ test("message2event: multiple attachments are combined into the same event where
 	}])
 })
 
+test("message2event: 2 images with text are bridged as one gallery, with the text as the caption", async t => {
+	const events = await messageToEvent({
+		content: "hey",
+		attachments: [{
+			filename: "image.png",
+			url: "https://cdn.discordapp.com/attachments/497161332244742154/1124628646431297546/image.png",
+			content_type: "image/png",
+			size: 1000,
+			width: 10,
+			height: 20
+		}, {
+			filename: "image.png",
+			url: "https://cdn.discordapp.com/attachments/122155380120748034/1106366167486038016/image.png",
+			content_type: "image/png",
+			size: 2000,
+			width: 30,
+			height: 40
+		}]
+	}, data.guild.general, {})
+	t.deepEqual(events, [{
+		$type: "m.room.message",
+		"m.mentions": {},
+		msgtype: "dm.filament.gallery",
+		body: "hey",
+		"m.url_previews": [],
+		itemtypes: [{
+			itemtype: "m.image",
+			body: "image.png",
+			filename: "image.png",
+			external_url: "https://bridge.example.org/download/discordcdn/497161332244742154/1124628646431297546/image.png",
+			url: "mxc://cadence.moe/qXoZktDqNtEGuOCZEADAMvhM",
+			info: {
+				mimetype: "image/png",
+				w: 10,
+				h: 20,
+				size: 1000
+			}
+		}, {
+			itemtype: "m.image",
+			body: "image.png",
+			filename: "image.png",
+			external_url: "https://bridge.example.org/download/discordcdn/122155380120748034/1106366167486038016/image.png",
+			url: "mxc://cadence.moe/ZDCNYnkPszxGKgObUIFmvjus",
+			info: {
+				mimetype: "image/png",
+				w: 30,
+				h: 40,
+				size: 2000
+			}
+		}]
+	}])
+})
+
+test("message2event: 2 images without text are bridged as one gallery with an empty caption", async t => {
+	const events = await messageToEvent({
+		content: "",
+		attachments: [{
+			filename: "image.png",
+			url: "https://cdn.discordapp.com/attachments/497161332244742154/1124628646431297546/image.png",
+			content_type: "image/png",
+			size: 1000,
+			width: 10,
+			height: 20
+		}, {
+			filename: "image.png",
+			url: "https://cdn.discordapp.com/attachments/122155380120748034/1106366167486038016/image.png",
+			content_type: "image/png",
+			size: 2000,
+			width: 30,
+			height: 40
+		}]
+	}, data.guild.general, {})
+	t.equal(events.length, 1)
+	t.equal(events[0].msgtype, "dm.filament.gallery")
+	t.equal(events[0].body, "")
+	t.deepEqual(events[0]["m.mentions"], {})
+	t.equal(events[0].itemtypes.length, 2)
+	t.equal(events[0].itemtypes[0].itemtype, "m.image")
+	t.equal(events[0].itemtypes[1].url, "mxc://cadence.moe/ZDCNYnkPszxGKgObUIFmvjus")
+})
+
+test("message2event: 1 image with text is not a gallery", async t => {
+	const events = await messageToEvent({
+		content: "hey",
+		attachments: [{
+			filename: "image.png",
+			url: "https://cdn.discordapp.com/attachments/122155380120748034/1106366167486038016/image.png",
+			content_type: "image/png",
+			size: 2000,
+			width: 30,
+			height: 40
+		}]
+	}, data.guild.general, {})
+	t.deepEqual(events, [{
+		$type: "m.room.message",
+		"m.mentions": {},
+		msgtype: "m.text",
+		body: "hey",
+		"m.url_previews": []
+	}, {
+		$type: "m.room.message",
+		"m.mentions": {},
+		msgtype: "m.image",
+		body: "image.png",
+		filename: "image.png",
+		external_url: "https://bridge.example.org/download/discordcdn/122155380120748034/1106366167486038016/image.png",
+		url: "mxc://cadence.moe/ZDCNYnkPszxGKgObUIFmvjus",
+		info: {
+			mimetype: "image/png",
+			w: 30,
+			h: 40,
+			size: 2000
+		}
+	}])
+})
+
+test("message2event: multiple images are separate events when galleries are disabled", async t => {
+	const {reg} = require("../../matrix/read-registration")
+	const before = reg.ooye.gallery_messages
+	reg.ooye.gallery_messages = false
+	try {
+		const events = await messageToEvent({
+			content: "hey",
+			attachments: [{
+				filename: "image.png",
+				url: "https://cdn.discordapp.com/attachments/497161332244742154/1124628646431297546/image.png",
+				content_type: "image/png",
+				size: 1000,
+				width: 10,
+				height: 20
+			}, {
+				filename: "image.png",
+				url: "https://cdn.discordapp.com/attachments/122155380120748034/1106366167486038016/image.png",
+				content_type: "image/png",
+				size: 2000,
+				width: 30,
+				height: 40
+			}]
+		}, data.guild.general, {})
+		t.deepEqual(events.map(e => e.msgtype), ["m.text", "m.image", "m.image"])
+		t.equal(events[1].url, "mxc://cadence.moe/qXoZktDqNtEGuOCZEADAMvhM")
+		t.equal(events[2].url, "mxc://cadence.moe/ZDCNYnkPszxGKgObUIFmvjus")
+	} finally {
+		reg.ooye.gallery_messages = before
+	}
+})
+
 test("message2event: type 4 channel name change", async t => {
 	const events = await messageToEvent(data.special_message.thread_name_change, data.guild.general)
 	t.deepEqual(events, [{

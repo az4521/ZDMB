@@ -1,26 +1,21 @@
-# Out Of Your Element
+# ZDMB — Zam Discord-Matrix Bridge
 
 <img src="docs/img/icon.png" height="128" width="128">
 
-Modern Matrix-to-Discord appservice bridge, created by [@cadence:cadence.moe](https://matrix.to/#/@cadence:cadence.moe)
+ZDMB is a fork of [Out Of Your Element](https://gitdab.com/cadence/out-of-your-element) (OOYE), the modern Matrix-to-Discord appservice bridge created by [@cadence:cadence.moe](https://matrix.to/#/@cadence:cadence.moe). It adds the features that the [Zam](https://github.com/az4521/Zam) Matrix client understands.
 
-[![Releases](https://img.shields.io/gitea/v/release/cadence/out-of-your-element?gitea_url=https%3A%2F%2Fgitdab.com&style=plastic&color=green)](https://gitdab.com/cadence/out-of-your-element/releases) [![Discuss on Matrix](https://img.shields.io/badge/discuss-%23out--of--your--element-white?style=plastic)](https://matrix.to/#/#out-of-your-element:cadence.moe)
+## Differences from Out Of Your Element
 
-![](https://cadence.moe/i/f42a3f)
+* **Username colours.** A Discord member's role colour is bridged as their username colour (MSC4522, `eu.she-a.color`), both on their room member event and on their global profile.
+* **Rich presence.** Discord activities (games, Spotify and other "Listening to" activities, streaming, watching, competing) are bridged to the `xyz.extera.msc4544.rpc` profile field from [MSC4544](https://github.com/matrix-org/matrix-spec-proposals/pull/4544). This uses the same per-server presence setting as normal presence.
+* **Media galleries.** A Discord message with several attachments is bridged as one `dm.filament.gallery` message ([MSC4274](https://github.com/matrix-org/matrix-spec-proposals/pull/4274)) with the message text as its caption, and Matrix galleries are bridged to Discord as one message with several attachments. Set `ooye.gallery_messages: false` in `registration.yaml` to keep OOYE's one-event-per-attachment behaviour for Discord-to-Matrix.
+* **Channel order.** Rooms in the space are ordered like the Discord channel list (using `m.space.child` `order`): by category, text channels before voice channels, then position. Threads appear right after their channel.
+* **Voice rooms.** Bridged voice channels let everyone join calls (the `m.call.member`, `org.matrix.msc3401.call.member` and `m.rtc.member` power levels are 0).
+* **No PluralKit or /plu/ral support.** Messages from proxy bots are treated like any other webhook message.
 
-## AI policy
+### Drop-in compatibility
 
-Out Of Your Element is 100% organically cultivated ethical hand-fed code. Let's work together to conserve that!
-
-## Why a new bridge?
-
-* Modern: Supports new Discord features like replies, threads and stickers, and new Matrix features like edits, spaces and space membership.
-* Efficient: Special attention has been given to memory usage, database indexes, disk footprint, runtime algorithms, and queries to the homeserver. [Efficiency details.](https://gitdab.com/cadence/out-of-your-element/src/branch/main/docs/developer-orientation.md)
-* Reliable: Any errors on either side are notified on Matrix and can be retried. Messages sent during bridge downtime will still be bridged after it comes back up.
-* Tested: A test suite and code coverage make sure all the logic and special cases work.
-* Simple development: No build step (it's JavaScript, not TypeScript), minimal/lightweight dependencies, and abstraction only where necessary so that less background knowledge is required. No need to learn about Intents or library functions.
-* No locking algorithm: Other bridges use a locking algorithm which is a source of frequent bugs. This bridge avoids the need for one.
-* Latest API: Being on the latest Discord API version lets it access all features, without the risk of deprecated API versions being removed.
+ZDMB uses the same `registration.yaml`, the same `ooye.db` database and the same database migrations as OOYE 3.8. You can stop OOYE, put ZDMB in its place, and start it: no data is converted. ZDMB adds no tables or columns, so you can also go back to OOYE later. The PluralKit tables (`sim_proxy`, `channel_speedbump`) are left in place but no longer written to.
 
 ## What works?
 
@@ -28,22 +23,20 @@ Most features you'd expect in both directions: messages, edits, deletions, forma
 
 Metadata is also synced: people's names, avatars, usernames; channel names, icons, topics; spaces containing rooms; custom emoji lists. Syncing Matrix rooms, room icons, and topics is optional: you can keep them different from the Discord ones if you prefer.
 
-I've also added some interesting features that I haven't seen in any other bridge:
+New spaces are invite-only, and their rooms can be joined by members of the space. This can be changed per server with `/privacy` or on the bridge website.
 
-* Members using the PluralKit bot each get their own persistent accounts
-* Replies from PluralKit members are restyled into native Matrix replies
-* Simulated user accounts are named @the_persons_username rather than @112233445566778899
-* Matrix custom emojis from private rooms are still visible on Discord as a sprite sheet
-* To save space, larger files from Discord are linked instead of reuploaded to Matrix (links don't expire)
-
-For more information about features, [see the user guide.](https://docs.ooye.org/for-users/user-guide/)
+For more information about features, [see the OOYE user guide.](https://docs.ooye.org/for-users/user-guide/)
 
 ## Caveats
 
 * This bridge is not designed for puppetting.
-* Direct Messaging is not supported until I figure out a good way of doing it.
-* Encrypted messages are not supported. Decryption is often unreliable on Matrix, and your messages end up in plaintext on Discord anyway, so there's not much advantage.
+* Direct Messaging is not supported.
+* Encrypted messages are not supported.
 
 ## Get started!
 
-[Read the installation instructions →](https://docs.ooye.org/for-hosters/install/)
+Installation is the same as for OOYE: [read the installation instructions →](https://docs.ooye.org/for-hosters/install/)
+
+## License
+
+AGPL-3.0-or-later, the same as Out Of Your Element. See `COPYING`.

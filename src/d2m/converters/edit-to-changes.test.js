@@ -2,6 +2,51 @@ const {test} = require("supertape")
 const {editToChanges} = require("./edit-to-changes")
 const data = require("../../../test/data")
 const Ty = require("../../types")
+const {db} = require("../../passthrough")
+
+/**
+ * Inserts rows into event_message for a message that only exists in these tests.
+ * @param {string} messageID
+ * @param {[eventID: string, subtype: string, part: number, reactionPart: number][]} rows
+ */
+function insertEventMessageRows(messageID, rows) {
+	db.prepare("INSERT INTO message_room (message_id, historical_room_index) SELECT ?, historical_room_index FROM historical_channel_room WHERE room_id = '!kLRqKKUQXcibIMtOpl:cadence.moe' LIMIT 1").run(messageID)
+	for (const [eventID, subtype, part, reactionPart] of rows) {
+		db.prepare("INSERT INTO event_message (event_id, event_type, event_subtype, message_id, part, reaction_part, source) VALUES (?, 'm.room.message', ?, ?, ?, ?, 1)").run(eventID, subtype, messageID, part, reactionPart)
+	}
+}
+
+const galleryTestAttachments = [{
+	filename: "image.png",
+	url: "https://cdn.discordapp.com/attachments/497161332244742154/1124628646431297546/image.png",
+	content_type: "image/png",
+	size: 1000,
+	width: 10,
+	height: 20
+}, {
+	filename: "image.png",
+	url: "https://cdn.discordapp.com/attachments/122155380120748034/1106366167486038016/image.png",
+	content_type: "image/png",
+	size: 2000,
+	width: 30,
+	height: 40
+}]
+
+const galleryTestItems = [{
+	itemtype: "m.image",
+	body: "image.png",
+	filename: "image.png",
+	external_url: "https://bridge.example.org/download/discordcdn/497161332244742154/1124628646431297546/image.png",
+	url: "mxc://cadence.moe/qXoZktDqNtEGuOCZEADAMvhM",
+	info: {mimetype: "image/png", w: 10, h: 20, size: 1000}
+}, {
+	itemtype: "m.image",
+	body: "image.png",
+	filename: "image.png",
+	external_url: "https://bridge.example.org/download/discordcdn/122155380120748034/1106366167486038016/image.png",
+	url: "mxc://cadence.moe/ZDCNYnkPszxGKgObUIFmvjus",
+	info: {mimetype: "image/png", w: 30, h: 40, size: 2000}
+}]
 
 test("edit2changes: edit by webhook", async t => {
 	let called = 0
@@ -434,4 +479,124 @@ test("edit2changes: don't generate new data in situations where m->d(->m) subtyp
 	t.deepEqual(eventsToSend, [])
 	t.deepEqual(promotions, [])
 	t.equal(senderMxid, null)
+})
+
+test("edit2changes: message from before galleries existed (text + 2 images) only replaces the text when the text is edited", async t => {
+	const messageID = "1500000000000000001"
+	insertEventMessageRows(messageID, [
+		["$legacyTextEvent1", "m.text", 0, 0],
+		["$legacyImageEvent1", "m.image", 1, 1],
+		["$legacyImageEvent2", "m.image", 2, 1]
+	])
+	let called = 0
+	const {eventsToRedact, eventsToReplace, eventsToSend, promotions} = await editToChanges({
+		id: messageID,
+		channel_id: "112760669178241024",
+		content: "edited text",
+		author: {id: "1000000000000000001", username: "cadence.worm", global_name: "Cadence"},
+		attachments: galleryTestAttachments
+	}, data.guild.general, {
+		getEvent(roomID, eventID) {
+			called++
+			t.equal(eventID, "$legacyTextEvent1")
+			return {content: {body: "old text"}}
+		}
+	})
+	t.deepEqual(eventsToRedact, [])
+	t.deepEqual(eventsToSend, [])
+	t.deepEqual(eventsToReplace, [{
+		oldID: "$legacyTextEvent1",
+		newContent: {
+			$type: "m.room.message",
+			msgtype: "m.text",
+			body: "* edited text",
+			"m.url_previews": [],
+			"m.mentions": {},
+			"m.new_content": {
+				msgtype: "m.text",
+				body: "edited text",
+				"m.url_previews": [],
+				"m.mentions": {}
+			},
+			"m.relates_to": {
+				rel_type: "m.replace",
+				event_id: "$legacyTextEvent1"
+			}
+		}
+	}])
+	t.deepEqual(promotions, [])
+	t.equal(called, 1)
+})
+
+test("edit2changes: gallery caption is edited", async t => {
+	const messageID = "1500000000000000002"
+	insertEventMessageRows(messageID, [
+		["$galleryEvent1", "dm.filament.gallery", 0, 0]
+	])
+	let called = 0
+	const {eventsToRedact, eventsToReplace, eventsToSend, promotions} = await editToChanges({
+		id: messageID,
+		channel_id: "112760669178241024",
+		content: "new caption",
+		author: {id: "1000000000000000001", username: "cadence.worm", global_name: "Cadence"},
+		attachments: galleryTestAttachments
+	}, data.guild.general, {
+		getEvent(roomID, eventID) {
+			called++
+			t.equal(eventID, "$galleryEvent1")
+			return {content: {body: "old caption", "m.mentions": {}, itemtypes: [{itemtype: "m.image", url: galleryTestItems[0].url}, {itemtype: "m.image", url: galleryTestItems[1].url}]}}
+		}
+	})
+	t.deepEqual(eventsToRedact, [])
+	t.deepEqual(eventsToSend, [])
+	t.deepEqual(eventsToReplace, [{
+		oldID: "$galleryEvent1",
+		newContent: {
+			$type: "m.room.message",
+			msgtype: "dm.filament.gallery",
+			body: "* new caption",
+			"m.url_previews": [],
+			"m.mentions": {},
+			itemtypes: galleryTestItems,
+			"m.new_content": {
+				msgtype: "dm.filament.gallery",
+				body: "new caption",
+				"m.url_previews": [],
+				"m.mentions": {},
+				itemtypes: galleryTestItems
+			},
+			"m.relates_to": {
+				rel_type: "m.replace",
+				event_id: "$galleryEvent1"
+			}
+		}
+	}])
+	t.deepEqual(promotions, [])
+	t.equal(called, 1)
+})
+
+test("edit2changes: gallery with unchanged caption and items is not replaced", async t => {
+	const messageID = "1500000000000000003"
+	insertEventMessageRows(messageID, [
+		["$galleryEvent2", "dm.filament.gallery", 0, 0]
+	])
+	let called = 0
+	const {eventsToRedact, eventsToReplace, eventsToSend, promotions} = await editToChanges({
+		id: messageID,
+		channel_id: "112760669178241024",
+		content: "same caption",
+		author: {id: "1000000000000000001", username: "cadence.worm", global_name: "Cadence"},
+		attachments: galleryTestAttachments
+	}, data.guild.general, {
+		getEvent(roomID, eventID) {
+			called++
+			t.equal(eventID, "$galleryEvent2")
+			return {content: {body: "same caption", "m.mentions": {}, itemtypes: [{itemtype: "m.image", url: galleryTestItems[0].url}, {itemtype: "m.image", url: galleryTestItems[1].url}]}}
+		}
+	})
+	t.deepEqual(eventsToRedact, [])
+	t.deepEqual(eventsToSend, [])
+	t.deepEqual(eventsToReplace, [])
+	t.deepEqual(promotions, [])
+	t.equal(called, 1)
 })

@@ -100,7 +100,7 @@ async function _interact({guild_id, data}, {api}) {
 					url: `https://matrix.to/#/${event.sender}`,
 					icon_url: avatar
 				},
-				description: `This Matrix message was delivered to Discord by **Out Of Your Element**.\n[View on Matrix →](<https://matrix.to/#/${message.room_id}/${message.event_id}?${via}>)\n\n${profileNote}**User ID**: [${event.sender}](<https://matrix.to/#/${event.sender}>)`,
+				description: `This Matrix message was delivered to Discord by **ZDMB**.\n[View on Matrix →](<https://matrix.to/#/${message.room_id}/${message.event_id}?${via}>)\n\n${profileNote}**User ID**: [${event.sender}](<https://matrix.to/#/${event.sender}>)`,
 				color: 0x0dbd8b,
 				fields: [{
 					name: "In Channels",

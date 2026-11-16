@@ -12,8 +12,8 @@ const messageToEvent = sync.require("../converters/message-to-event")
 const api = sync.require("../../matrix/api")
 /** @type {import("./register-user")} */
 const registerUser = sync.require("./register-user")
-/** @type {import("./speedbump")} */
-const speedbump = sync.require("./speedbump")
+/** @type {import("./webhook-sender")} */
+const webhookSender = sync.require("./webhook-sender")
 /** @type {import("../actions/create-room")} */
 const createRoom = sync.require("../actions/create-room")
 /** @type {import("../actions/poll-end")} */
@@ -35,7 +35,7 @@ async function sendMessage(message, channel, guild) {
 
 	let senderMxid = null
 	if (dUtils.isWebhookMessage(message)) {
-		senderMxid = await speedbump.getWebhookSenderId(message, guild.id, roomID)
+		senderMxid = await webhookSender.getWebhookSenderId(message, guild.id, roomID)
 	} else {
 		// not a webhook
 		if (message.author.id === discord.application.id) {

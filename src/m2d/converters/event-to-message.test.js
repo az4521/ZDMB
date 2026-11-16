@@ -3718,7 +3718,7 @@ test("event2message: mentioning discord users works when URL encoded", async t =
 	)
 })
 
-test("event2message: mentioning PK discord users works", async t => {
+test("event2message: mentioning legacy PK sims writes their name instead of a broken mention", async t => {
 	t.deepEqual(
 		await eventToMessage({
 			content: {
@@ -3742,7 +3742,7 @@ test("event2message: mentioning PK discord users works", async t => {
 			messagesToEdit: [],
 			messagesToSend: [{
 				username: "cadence [they]",
-				content: "I'm just **@Azalea &flwr; 🌺** (<@196188877885538304>) testing mentions",
+				content: "I'm just **@Azalea** testing mentions",
 				avatar_url: "https://bridge.example.org/download/letter-avatar?letter=C&hue=90",
 				allowed_mentions: {
 					parse: ["users", "roles"]
@@ -5026,6 +5026,173 @@ test("event2message: evil encrypted image attachment works", async t => {
 			}]
 		}
 	)
+})
+
+test("event2message: gallery of 2 images with caption is one message with 2 attachments", async t => {
+	t.deepEqual(
+		await eventToMessage({
+			type: "m.room.message",
+			sender: "@cadence:cadence.moe",
+			content: {
+				msgtype: "dm.filament.gallery",
+				body: "my caption",
+				itemtypes: [{
+					itemtype: "m.image",
+					body: "cool cat.png",
+					filename: "cool cat.png",
+					info: {mimetype: "image/png", size: 43170, w: 480, h: 480},
+					url: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"
+				}, {
+					itemtype: "m.image",
+					body: "file.png",
+					filename: "file.png",
+					info: {mimetype: "image/png", size: 1000},
+					url: "mxc://agiadn.org/3SvzETkab3XBDM6HCMJxpOryIDxMO31j"
+				}]
+			},
+			event_id: "$gallery1",
+			room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+		}),
+		{
+			ensureJoined: [],
+			messagesToDelete: [],
+			messagesToEdit: [],
+			messagesToSend: [{
+				username: "cadence [they]",
+				content: "my caption",
+				avatar_url: "https://bridge.example.org/download/matrix/cadence.moe/azCAhThKTojXSZJRoWwZmhvU?preset=avatar",
+				allowed_mentions: {
+					parse: ["users", "roles"]
+				},
+				attachments: [{id: "0", filename: "cool cat.png"}, {id: "1", filename: "file.png"}],
+				pendingFiles: [{name: "cool cat.png", mxc: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"}, {name: "file.png", mxc: "mxc://agiadn.org/3SvzETkab3XBDM6HCMJxpOryIDxMO31j"}]
+			}]
+		}
+	)
+})
+
+test("event2message: gallery with 12 images is split into 2 messages of up to 10 attachments", async t => {
+	const itemtypes = Array.from({length: 12}, (_, i) => ({
+		itemtype: "m.image",
+		body: `${i}.png`,
+		filename: `${i}.png`,
+		info: {mimetype: "image/png", size: 1000},
+		url: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"
+	}))
+	const messages = (await eventToMessage({
+		type: "m.room.message",
+		sender: "@cadence:cadence.moe",
+		content: {
+			msgtype: "dm.filament.gallery",
+			body: "",
+			itemtypes
+		},
+		event_id: "$gallery2",
+		room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+	})).messagesToSend
+	t.equal(messages.length, 2)
+	t.deepEqual(messages[0].attachments, Array.from({length: 10}, (_, i) => ({id: String(i), filename: `${i}.png`})))
+	t.equal(messages[0].pendingFiles.length, 10)
+	t.equal(messages[0].content, "")
+	t.deepEqual(messages[1].attachments, [{id: "0", filename: "10.png"}, {id: "1", filename: "11.png"}])
+	t.deepEqual(messages[1].pendingFiles, [{name: "10.png", mxc: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"}, {name: "11.png", mxc: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"}])
+	t.equal(messages[1].content, "")
+	t.equal(messages[1].username, "cadence [they]")
+})
+
+test("event2message: gallery item too large for Discord becomes a link in the caption", async t => {
+	t.deepEqual(
+		await eventToMessage({
+			type: "m.room.message",
+			sender: "@cadence:cadence.moe",
+			content: {
+				msgtype: "m.gallery",
+				body: "",
+				itemtypes: [{
+					itemtype: "m.image",
+					body: "big.png",
+					filename: "big.png",
+					info: {mimetype: "image/png", size: 40_000_000},
+					url: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"
+				}, {
+					itemtype: "m.image",
+					body: "small.png",
+					filename: "small.png",
+					info: {mimetype: "image/png", size: 1000},
+					url: "mxc://agiadn.org/3SvzETkab3XBDM6HCMJxpOryIDxMO31j"
+				}, {
+					itemtype: "m.sticker",
+					body: "ignored",
+					url: "mxc://cadence.moe/ignored"
+				}, "not an object"]
+			},
+			event_id: "$gallery3",
+			room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+		}),
+		{
+			ensureJoined: [],
+			messagesToDelete: [],
+			messagesToEdit: [],
+			messagesToSend: [{
+				username: "cadence [they]",
+				content: "🖼️ _Uploaded file: [big.png](https://bridge.example.org/download/matrix/cadence.moe/IvxVJFLEuksCNnbojdSIeEvn) (40 MB)_",
+				avatar_url: "https://bridge.example.org/download/matrix/cadence.moe/azCAhThKTojXSZJRoWwZmhvU?preset=avatar",
+				allowed_mentions: {
+					parse: ["users", "roles"]
+				},
+				attachments: [{id: "0", filename: "small.png"}],
+				pendingFiles: [{name: "small.png", mxc: "mxc://agiadn.org/3SvzETkab3XBDM6HCMJxpOryIDxMO31j"}]
+			}]
+		}
+	)
+})
+
+test("event2message: encrypted gallery item uses its key and iv", async t => {
+	const messages = (await eventToMessage({
+		type: "m.room.message",
+		sender: "@cadence:cadence.moe",
+		content: {
+			msgtype: "dm.filament.gallery",
+			body: "",
+			itemtypes: [{
+				itemtype: "m.image",
+				body: "image.png",
+				info: {mimetype: "image/png", size: 105691, w: 1192, h: 309},
+				file: {
+					v: "v2",
+					key: {
+						alg: "A256CTR",
+						ext: true,
+						k: "QTo-oMPnN1Rbc7vBFg9WXMgoctscdyxdFEIYm8NYceo",
+						key_ops: ["encrypt", "decrypt"],
+						kty: "oct"
+					},
+					iv: "Va9SHZpIn5kAAAAAAAAAAA",
+					hashes: {
+						sha256: "OUZqZFBcANFt42iAKET9YXfWMCdT0BX7QO0Eyk9q4Js"
+					},
+					url: "mxc://heyquark.com/LOGkUTlVFrqfiExlGZNgCJJX",
+					mimetype: "image/png"
+				}
+			}, {
+				itemtype: "m.image",
+				body: "cool cat.png",
+				filename: "cool cat.png",
+				info: {mimetype: "image/png", size: 43170},
+				url: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"
+			}]
+		},
+		event_id: "$gallery4",
+		room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+	})).messagesToSend
+	t.equal(messages.length, 1)
+	t.deepEqual(messages[0].attachments, [{id: "0", filename: "image.png"}, {id: "1", filename: "cool cat.png"}])
+	t.deepEqual(messages[0].pendingFiles, [{
+		name: "image.png",
+		mxc: "mxc://heyquark.com/LOGkUTlVFrqfiExlGZNgCJJX",
+		key: "QTo-oMPnN1Rbc7vBFg9WXMgoctscdyxdFEIYm8NYceo",
+		iv: "Va9SHZpIn5kAAAAAAAAAAA"
+	}, {name: "cool cat.png", mxc: "mxc://cadence.moe/IvxVJFLEuksCNnbojdSIeEvn"}])
 })
 
 test("event2message: large attachments are uploaded if the server boost level is sufficient", async t => {

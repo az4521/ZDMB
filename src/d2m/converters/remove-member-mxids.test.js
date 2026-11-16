@@ -22,9 +22,6 @@ test("remove member mxids: removes sims too", t => {
 		membership: [{
 			mxid: '@_ooye_ampflower:cadence.moe',
 			room_id: '!qzDBLKlildpzrrOnFZ:cadence.moe'
-		}, {
-			mxid: '@_ooye__pk_zoego:cadence.moe',
-			room_id: '!qzDBLKlildpzrrOnFZ:cadence.moe'
 		}]
 	})
 })

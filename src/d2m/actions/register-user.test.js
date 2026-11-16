@@ -1,4 +1,4 @@
-const {_memberToStateContent, _memberToPowerLevel} = require("./register-user")
+const {_memberToStateContent, _memberToPowerLevel, memberToColor} = require("./register-user")
 const {test} = require("supertape")
 const data = require("../../../test/data")
 const mixin = require("@cloudrac3r/mixin-deep")
@@ -49,6 +49,7 @@ test("member2state: with member nick and avatar", async t => {
 		await _memberToStateContent(data.member.sheep.user, data.member.sheep, data.guild.general.id),
 		{
 			avatar_url: "mxc://cadence.moe/rfemHmAtcprjLEiPiEuzPhpl",
+			"eu.she-a.color": {on_dark: "#ff8333", on_light: "#ff8333"},
 			displayname: "The Expert's Submarine",
 			membership: "join",
 			"moe.cadence.ooye.member": {
@@ -62,6 +63,47 @@ test("member2state: with member nick and avatar", async t => {
 			}
 		}
 	)
+})
+
+test("member2color: picks the highest positioned coloured role", t => {
+	const color = memberToColor({
+		roles: ["217013981053845504", "212762309364285440", "503685967463448616"]
+	}, data.guild.general.roles)
+	t.equal(color, "#a901ff")
+})
+
+test("member2color: ignores roles with colour 0", t => {
+	const roles = [
+		{id: "100", color: 0, position: 10},
+		{id: "200", color: 0x00ff00, position: 5}
+	]
+	const color = memberToColor({roles: ["100", "200"]}, roles)
+	t.equal(color, "#00ff00")
+})
+
+test("member2color: null if no member, no roles, or no coloured roles", t => {
+	t.equal(memberToColor(undefined, data.guild.general.roles), null)
+	t.equal(memberToColor({roles: ["217013981053845504"]}, undefined), null)
+	t.equal(memberToColor({roles: []}, data.guild.general.roles), null)
+	t.equal(memberToColor({roles: ["503685967463448616"]}, data.guild.general.roles), null)
+})
+
+test("member2color: pads hex to six digits", t => {
+	const roles = [{id: "100", color: 1, position: 1}]
+	t.equal(memberToColor({roles: ["100"]}, roles), "#000001")
+})
+
+test("member2color: ties on position go to the higher role ID", t => {
+	const roles = [
+		{id: "9", color: 0x111111, position: 4},
+		{id: "10", color: 0x222222, position: 4}
+	]
+	t.equal(memberToColor({roles: ["9", "10"]}, roles), "#222222")
+})
+
+test("member2color: prefers colors.primary_color when present", t => {
+	const roles = [{id: "100", color: 0, position: 1, colors: {primary_color: 0xabcdef}}]
+	t.equal(memberToColor({roles: ["100"]}, roles), "#abcdef")
 })
 
 test("member2power: default to zero if member roles unknown", async t => {

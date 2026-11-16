@@ -94,7 +94,7 @@ as.router.post("/api/log-in-with-matrix", defineEventHandler(async event => {
 	if (next) paramsObject.next = next
 	const params = new URLSearchParams(paramsObject)
 	let link = `${reg.ooye.bridge_origin}/log-in-with-matrix?${params.toString()}`
-	const body = `Hi, this is Out Of Your Element! You just clicked the "log in" button on the website.\nOpen this link to finish: ${link}\nThe link can be used once.`
+	const body = `Hi, this is ZDMB! You just clicked the "log in" button on the website.\nOpen this link to finish: ${link}\nThe link can be used once.`
 	await api.sendEvent(roomID, "m.room.message", {
 		msgtype: "m.text",
 		body

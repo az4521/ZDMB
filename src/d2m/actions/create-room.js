@@ -203,6 +203,11 @@ async function channelToKState(channel, guild, di) {
 			"m.type": "m.voice",
 			"m.name": customName || channel.name
 		}
+		// Anybody can join calls (Zam's "Join calls (voice/video)" permission)
+		const powerLevelEvents = channelKState["m.room.power_levels/"].events
+		powerLevelEvents["org.matrix.msc3401.call.member"] = 0
+		powerLevelEvents["m.call.member"] = 0
+		powerLevelEvents["m.rtc.member"] = 0
 	}
 
 	// Don't add a space parent if it's self service
@@ -297,6 +302,43 @@ async function postApplyPowerLevels(kstate, callback) {
 	}
 
 	return roomCreate
+}
+
+/**
+ * Left-pads a number or ID with zeros to a fixed width. Used to build sortable order strings.
+ * @param {number | string} value
+ * @param {number} width
+ */
+function padOrder(value, width) {
+	return String(value).padStart(width, "0")
+}
+
+/**
+ * Matrix spaces sort their children by the `order` string of each m.space.child event (lexicographic, max 50 printable ASCII chars).
+ * This mirrors Discord's channel list: uncategorised channels first, then by category position, then text before voice, then by channel position.
+ * Threads sort directly after their parent channel. Forum and media threads are grouped by their own space, so they have no order.
+ * @param {{id: string, type: number, position?: number, parent_id?: string | null}} channel
+ * @returns {string | undefined}
+ */
+function channelToSpaceOrder(channel) {
+	const isThread = [DiscordTypes.ChannelType.PublicThread, DiscordTypes.ChannelType.PrivateThread, DiscordTypes.ChannelType.AnnouncementThread].includes(channel.type)
+	// @ts-ignore
+	const parentChannel = discord.channels.get(channel.parent_id || "")
+
+	if (isThread) {
+		if (!parentChannel) return undefined
+		if (parentChannel.type === DiscordTypes.ChannelType.GuildForum || parentChannel.type === DiscordTypes.ChannelType.GuildMedia) return undefined
+		const parentOrder = channelToSpaceOrder(parentChannel)
+		if (parentOrder === undefined) return undefined
+		return parentOrder + padOrder(channel.id, 20)
+	}
+
+	const categoryPosition = parentChannel?.type === DiscordTypes.ChannelType.GuildCategory ? (parentChannel.position ?? 0) + 1 : 0
+	const isVoice = channel.type === DiscordTypes.ChannelType.GuildVoice || channel.type === DiscordTypes.ChannelType.GuildStageVoice
+	const group = isVoice ? "1" : "0"
+	const order = padOrder(categoryPosition, 4) + group + padOrder(channel.position ?? 0, 4) + padOrder(channel.id, 20)
+	assert(order.length <= 50, `space order "${order}" is too long`)
+	return order
 }
 
 /**
@@ -560,6 +602,7 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 	}
 
 	const spaceKState = await ks.roomToKState(spaceID)
+	/** @type {{via?: string[], order?: string}} */
 	let spaceEventContent = {}
 	if (
 		channel.type !== DiscordTypes.ChannelType.PrivateThread // private threads do not belong in the space (don't offer people something they can't join)
@@ -571,11 +614,57 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 		spaceEventContent = {
 			via: [reg.ooye.server_name]
 		}
+		const order = channelToSpaceOrder(channel)
+		if (typeof order === "string") spaceEventContent.order = order
 	}
 	const spaceDiff = ks.diffKState(spaceKState, {
 		[`m.space.child/${roomID}`]: spaceEventContent
 	})
 	return ks.applyKStateDiffToRoom(spaceID, spaceDiff)
+}
+
+/**
+ * Update the `order` of every bridged room that is already a child of the guild's space, reading the space state only once.
+ * Children that were removed from the space (empty m.space.child content) are left alone, and so are spaces in self-service mode,
+ * where the person who linked the rooms arranges them.
+ * Used at startup, so that spaces bridged before ZDMB get ordered, and when a category moves, since Discord only sends
+ * CHANNEL_UPDATE for the category itself and not for its children.
+ * @param {string} guildID
+ */
+async function syncSpaceOrder(guildID) {
+	const autocreate = select("guild_active", "autocreate", {guild_id: guildID}).pluck().get()
+	if (autocreate === 0) return
+	const spaceID = select("guild_space", "space_id", {guild_id: guildID}).pluck().get()
+	if (!spaceID) return
+
+	const spaceKState = await ks.roomToKState(spaceID)
+	const target = {}
+	const rows = select("channel_room", ["channel_id", "room_id"], {guild_id: guildID}).all()
+	for (const row of rows) {
+		const key = `m.space.child/${row.room_id}`
+		const existing = spaceKState[key]
+		if (!existing?.via) continue // not in this space, or removed from it
+		// @ts-ignore
+		const channel = discord.channels.get(row.channel_id)
+		if (!channel) continue
+		const order = channelToSpaceOrder(channel)
+		if (order === undefined || existing.order === order) continue
+		target[key] = {...existing, order}
+	}
+	if (!Object.keys(target).length) return
+	const spaceDiff = ks.diffKState(spaceKState, target)
+	await ks.applyKStateDiffToRoom(spaceID, spaceDiff)
+}
+
+/**
+ * Discord only sends CHANNEL_UPDATE for a category when it is moved, so re-sort the bridged children in the space.
+ * @param {string} categoryID
+ */
+async function syncCategoryChildrenOrder(categoryID) {
+	// @ts-ignore
+	const guildID = discord.channels.get(categoryID)?.guild_id
+	if (!guildID) return
+	await syncSpaceOrder(guildID)
 }
 
 async function createAllForGuild(guildID) {
@@ -603,5 +692,8 @@ module.exports.postApplyPowerLevels = postApplyPowerLevels
 module.exports._convertNameAndTopic = convertNameAndTopic
 module.exports._syncSpaceMember = _syncSpaceMember
 module.exports.unbridgeChannel = unbridgeChannel
+module.exports.channelToSpaceOrder = channelToSpaceOrder
+module.exports.syncCategoryChildrenOrder = syncCategoryChildrenOrder
+module.exports.syncSpaceOrder = syncSpaceOrder
 module.exports.existsOrAutocreatable = existsOrAutocreatable
 module.exports.assertExistsOrAutocreatable = assertExistsOrAutocreatable
