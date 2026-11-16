@@ -605,18 +605,47 @@ test("message2event: voice message", async t => {
 	const events = await messageToEvent(data.message.voice_message)
 	t.deepEqual(events, [{
 		$type: "m.room.message",
-      body: "voice-message.ogg",
-      external_url: "https://bridge.example.org/download/discordcdn/1099031887500034088/1112476845502365786/voice-message.ogg",
-      filename: "voice-message.ogg",
-      info: {
-        duration: 3960,
-        mimetype: "audio/ogg",
-        size: 10584,
+		body: "Voice message",
+		external_url: "https://bridge.example.org/download/discordcdn/1099031887500034088/1112476845502365786/voice-message.ogg",
+		filename: "voice-message.ogg",
+		info: {
+			duration: 3960,
+			mimetype: "audio/ogg",
+			size: 10584,
 		},
-      "m.mentions": {},
-      msgtype: "m.audio",
-      url: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB"
+		"m.mentions": {},
+		msgtype: "m.audio",
+		url: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB",
+		"org.matrix.msc3245.voice": {},
+		"org.matrix.msc1767.audio": {
+			duration: 3960,
+			waveform: [0, 32, 92, 0, 48, 0, 241, 108, 8, 0, 0, 0, 137, 454, 12, 92, 0, 0, 0, 0, 108, 205, 0, 76, 64, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+		}
 	}])
+})
+
+test("message2event: voice message with flag but no waveform has empty waveform", async t => {
+	const message = structuredClone(data.message.voice_message)
+	delete message.attachments[0].waveform
+	const events = await messageToEvent(message)
+	t.equal(events[0].msgtype, "m.audio")
+	t.equal(events[0].body, "Voice message")
+	t.deepEqual(events[0]["org.matrix.msc1767.audio"], {duration: 3960, waveform: []})
+	t.deepEqual(events[0]["org.matrix.msc3245.voice"], {})
+})
+
+test("message2event: normal audio attachment is not treated as a voice message", async t => {
+	const message = structuredClone(data.message.voice_message)
+	message.flags = 0
+	delete message.attachments[0].waveform
+	message.attachments[0].filename = "song.ogg"
+	message.attachments[0].content_type = "audio/ogg"
+	const events = await messageToEvent(message)
+	t.equal(events.length, 1)
+	t.equal(events[0].msgtype, "m.audio")
+	t.equal(events[0].body, "song.ogg")
+	t.equal("org.matrix.msc3245.voice" in events[0], false)
+	t.equal("org.matrix.msc1767.audio" in events[0], false)
 })
 
 test("message2event: misc file", async t => {

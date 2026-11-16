@@ -1,7 +1,7 @@
 // @ts-check
 
 const {test} = require("supertape")
-const {RPC_FIELD, ACTIVITY_TYPE, MUSIC_TYPE, activityToRpcEntry, activitiesToRpc, activityImageUrls} = require("./activity-to-rpc")
+const {RPC_FIELD, ACTIVITY_TYPE, MUSIC_TYPE, STATUS_FIELD, activityToRpcEntry, activitiesToRpc, activityImageUrls, activitiesToStatus} = require("./activity-to-rpc")
 
 test("activity2rpc: field name is the unstable MSC4544 name", t => {
 	t.equal(RPC_FIELD, "xyz.extera.msc4544.rpc")
@@ -151,4 +151,56 @@ test("activity2rpc: image URLs for Spotify, media proxy, app assets and unknown 
 	t.deepEqual(activityImageUrls({
 		assets: {large_image: "987"},
 	}), {})
+})
+
+test("activity2status: status field name is the MSC4426 name", t => {
+	t.equal(STATUS_FIELD, "org.matrix.msc4426.status")
+})
+
+test("activity2status: unicode emoji and text of a custom status, trimmed", t => {
+	const result = activitiesToStatus([
+		{name: "Custom Status", type: 4, state: "  Coding  ", emoji: {name: "💻"}},
+	])
+	t.deepEqual(result, {text: "Coding", emoji: "💻"})
+})
+
+test("activity2status: custom Discord emoji (with an id) is replaced with an empty string", t => {
+	const result = activitiesToStatus([
+		{name: "Custom Status", type: 4, state: "Hi", emoji: {name: "partyblob", id: "123", animated: true}},
+	])
+	t.deepEqual(result, {text: "Hi", emoji: ""})
+})
+
+test("activity2status: text is truncated to 64 characters and emoji to one whole emoji", t => {
+	const result = activitiesToStatus([
+		{name: "Custom Status", type: 4, state: "y".repeat(100), emoji: {name: "🔥".repeat(20)}},
+	])
+	t.equal(Array.from(result?.text ?? "").length, 64)
+	t.equal(result?.emoji, "🔥")
+})
+
+test("activity2status: multi-codepoint emojis are kept whole", t => {
+	const family = "👨‍👩‍👧‍👦"
+	t.equal(activitiesToStatus([{name: "Custom Status", type: 4, emoji: {name: family}}])?.emoji, family)
+})
+
+test("activity2status: emoji-only and text-only statuses are both allowed", t => {
+	t.deepEqual(activitiesToStatus([{name: "Custom Status", type: 4, emoji: {name: "🎮"}}]), {text: "", emoji: "🎮"})
+	t.deepEqual(activitiesToStatus([{name: "Custom Status", type: 4, state: "Away"}]), {text: "Away", emoji: ""})
+})
+
+test("activity2status: returns null when there is no custom status or nothing to show", t => {
+	t.equal(activitiesToStatus(undefined), null)
+	t.equal(activitiesToStatus([]), null)
+	t.equal(activitiesToStatus([{name: "Game", type: 0, state: "Lobby"}]), null)
+	t.equal(activitiesToStatus([{name: "Custom Status", type: 4, state: "   ", emoji: {name: "x", id: "1"}}]), null)
+	t.equal(activitiesToStatus([{name: "Custom Status", type: 4}]), null)
+})
+
+test("activity2status: the custom status is used when other activities are present", t => {
+	const result = activitiesToStatus([
+		{name: "Game", type: 0, state: "Lobby"},
+		{name: "Custom Status", type: 4, state: "Busy", emoji: {name: "🚫"}},
+	])
+	t.deepEqual(result, {text: "Busy", emoji: "🚫"})
 })

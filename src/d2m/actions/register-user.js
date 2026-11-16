@@ -19,6 +19,8 @@ const mxUtils = sync.require("../../matrix/utils")
 const userToMxid = sync.require("../converters/user-to-mxid")
 /** @type {import("./create-room")} */
 const createRoom = sync.require("./create-room")
+/** @type {import("./sync-banner")} */
+const syncBanner = sync.require("./sync-banner")
 /** @type {import("xxhash-wasm").XXHashAPI} */ // @ts-ignore
 let hasher = null
 // @ts-ignore
@@ -254,6 +256,8 @@ function _hashProfileContent(content, powerLevel) {
  */
 async function syncUser(user, member, channel, guild, roomID, interactionMetadata) {
 	const mxid = await ensureSimJoined(user, roomID)
+	// Lazy and rate-limited, so do not wait for it
+	syncBanner.maybeSyncBanner(user.id, mxid)
 	const content = await memberToStateContent(user, member, guild.id)
 	const powerLevel = memberToPowerLevel(user, member, guild, channel)
 	const colour = memberToColor(member, guild.roles)

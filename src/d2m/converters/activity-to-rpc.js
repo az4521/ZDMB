@@ -15,6 +15,10 @@ const MUSIC_TYPE = "xyz.extera.msc4544.rpc.music"
 const MAX_ENTRIES = 4
 const MAX_TEXT_LENGTH = 128
 
+// Custom status is published as an MSC4426 profile field, which the Zam client reads
+const STATUS_FIELD = "org.matrix.msc4426.status"
+const STATUS_TEXT_LENGTH = 64
+
 // Discord activity types (https://discord.com/developers/docs/events/gateway-events#activity-object-activity-types)
 const TYPE_PLAYING = 0
 const TYPE_STREAMING = 1
@@ -233,7 +237,29 @@ function activitiesToRpc(activities, expiry, mxcByUrl = new Map()) {
 	return entries
 }
 
+/**
+ * Finds the custom status (activity type 4) and converts it into the MSC4426 status value.
+ * Custom Discord emoji (with an id) cannot be shown on Matrix, so they are left out.
+ * @param {import("discord-api-types/v10").GatewayActivity[] | undefined} activities
+ * @returns {{text: string, emoji: string} | null} null if there is nothing to show
+ */
+function activitiesToStatus(activities) {
+	if (!Array.isArray(activities)) return null
+	const custom = /** @type {any} */ (activities.find(activity => activity?.type === TYPE_CUSTOM_STATUS))
+	if (!custom) return null
+	const rawText = typeof custom.state === "string" ? custom.state.trim() : ""
+	const text = Array.from(rawText).slice(0, STATUS_TEXT_LENGTH).join("")
+	const rawEmoji = custom.emoji && !custom.emoji.id && typeof custom.emoji.name === "string" ? custom.emoji.name.trim() : ""
+	// One whole grapheme, so that multi-codepoint emojis (ZWJ sequences, flags, skin tones) are never cut in half
+	const firstGrapheme = new Intl.Segmenter(undefined, {granularity: "grapheme"}).segment(rawEmoji)[Symbol.iterator]().next().value?.segment ?? ""
+	const emoji = firstGrapheme.length <= 32 ? firstGrapheme : ""
+	if (!text && !emoji) return null
+	return {text, emoji}
+}
+
 module.exports.RPC_FIELD = RPC_FIELD
+module.exports.STATUS_FIELD = STATUS_FIELD
+module.exports.activitiesToStatus = activitiesToStatus
 module.exports.ACTIVITY_TYPE = ACTIVITY_TYPE
 module.exports.MUSIC_TYPE = MUSIC_TYPE
 module.exports.activityToRpcEntry = activityToRpcEntry

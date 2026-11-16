@@ -139,10 +139,21 @@ const embedTitleParser = markdown.markdownEngine.parserFor({
 })
 
 /**
+ * Discord voice message waveforms are base64-encoded bytes from 0 to 255. Matrix expects integers from 0 to 1024.
+ * @param {unknown} waveform
+ * @returns {number[]}
+ */
+function voiceWaveformToMatrix(waveform) {
+	if (typeof waveform !== "string") return []
+	const bytes = Buffer.from(waveform, "base64")
+	return Array.from(bytes, b => Math.round(b * 1024 / 255))
+}
+
+/**
  * @param {{room?: boolean, user_ids?: string[]}} mentions
  * @param {Omit<DiscordTypes.APIAttachment, "id" | "proxy_url"> & {proxy_url?: string}} attachment
  * @param {boolean} [alwaysLink]
- * @param {{fetch?: typeof fetch}} [di]
+ * @param {{fetch?: typeof fetch, isVoiceMessage?: boolean}} [di]
  */
 async function attachmentToEvent(mentions, attachment, alwaysLink, di) {
 	const emoji =
@@ -240,19 +251,28 @@ async function attachmentToEvent(mentions, attachment, alwaysLink, di) {
 		}
 	}
 	if (attachment.content_type?.startsWith("audio/")) {
+		const isVoiceMessage = !!di?.isVoiceMessage || !!attachment.waveform
+		const duration = attachment.duration_secs && Math.round(attachment.duration_secs * 1000)
 		return {
 			$type: "m.room.message",
 			"m.mentions": mentions,
 			msgtype: "m.audio",
 			url: await file.uploadDiscordFileToMxc(attachment.url),
 			external_url: externalURL,
-			body: attachment.description || attachment.filename,
+			body: isVoiceMessage ? "Voice message" : attachment.description || attachment.filename,
 			filename: attachment.filename,
 			info: {
 				mimetype: attachment.content_type,
 				size: attachment.size,
-				duration: attachment.duration_secs && Math.round(attachment.duration_secs * 1000)
-			}
+				duration
+			},
+			...(isVoiceMessage ? {
+				"org.matrix.msc3245.voice": {},
+				"org.matrix.msc1767.audio": {
+					duration: Math.round((attachment.duration_secs || 0) * 1000),
+					waveform: voiceWaveformToMatrix(attachment.waveform)
+				}
+			} : {})
 		}
 	}
 	// else
@@ -928,7 +948,7 @@ async function messageToEvent(message, guild, options = {}, di) {
 
 	// Then attachments
 	if (message.attachments) {
-		const attachmentEvents = await Promise.all(message.attachments.map(attachment => attachmentToEvent(mentions, attachment, false, {fetch: di?.fetch})))
+		const attachmentEvents = await Promise.all(message.attachments.map(attachment => attachmentToEvent(mentions, attachment, false, {fetch: di?.fetch, isVoiceMessage: !!((message.flags || 0) & DiscordTypes.MessageFlags.IsVoiceMessage)})))
 		const mediaEvents = attachmentEvents.filter(e => GALLERY_ITEM_MSGTYPES.includes(e.msgtype))
 
 		if ((reg.ooye.gallery_messages ?? true) && mediaEvents.length >= 2) {

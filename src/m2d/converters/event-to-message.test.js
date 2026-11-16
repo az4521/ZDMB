@@ -4888,6 +4888,75 @@ test("event2message: attachments have a generated filename if it was missing", a
 	)
 })
 
+test("event2message: voice messages are sent as audio files named voice-message with no caption", async t => {
+	t.deepEqual(
+		await eventToMessage({
+			type: "m.room.message",
+			sender: "@cadence:cadence.moe",
+			content: {
+				body: "Voice message",
+				info: {
+					mimetype: "audio/ogg",
+					size: 10584,
+					duration: 3960
+				},
+				msgtype: "m.audio",
+				url: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB",
+				"org.matrix.msc3245.voice": {},
+				"org.matrix.msc1767.audio": {duration: 3960, waveform: [0, 512, 1024]}
+			},
+			event_id: "$CXQy3Wmg1A-gL_xAesC1HQcQTEXwICLdSwwUx55FBTI",
+			room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+		}),
+		{
+			ensureJoined: [],
+			messagesToDelete: [],
+			messagesToEdit: [],
+			messagesToSend: [{
+				username: "cadence [they]",
+				content: "",
+				avatar_url: "https://bridge.example.org/download/matrix/cadence.moe/azCAhThKTojXSZJRoWwZmhvU?preset=avatar",
+				attachments: [{id: "0", filename: "voice-message.ogg"}],
+				pendingFiles: [{name: "voice-message.ogg", mxc: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB"}]
+			}]
+		}
+	)
+})
+
+test("event2message: voice message with a voice-message filename has no 'Voice message' caption", async t => {
+	t.deepEqual(
+		await eventToMessage({
+			type: "m.room.message",
+			sender: "@cadence:cadence.moe",
+			content: {
+				body: "Voice message",
+				filename: "voice-message.ogg",
+				info: {
+					mimetype: "audio/ogg",
+					size: 10584
+				},
+				msgtype: "m.audio",
+				url: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB",
+				"org.matrix.msc3245.voice": {}
+			},
+			event_id: "$CXQy3Wmg1A-gL_xAesC1HQcQTEXwICLdSwwUx55FBTI",
+			room_id: "!BnKuBPCvyfOkhcUjEu:cadence.moe"
+		}),
+		{
+			ensureJoined: [],
+			messagesToDelete: [],
+			messagesToEdit: [],
+			messagesToSend: [{
+				username: "cadence [they]",
+				content: "",
+				avatar_url: "https://bridge.example.org/download/matrix/cadence.moe/azCAhThKTojXSZJRoWwZmhvU?preset=avatar",
+				attachments: [{id: "0", filename: "voice-message.ogg"}],
+				pendingFiles: [{name: "voice-message.ogg", mxc: "mxc://cadence.moe/MRRPDggXQMYkrUjTpxQbmcxB"}]
+			}]
+		}
+	)
+})
+
 test("event2message: encrypted image attachments work", async t => {
 	t.deepEqual(
 		await eventToMessage({

@@ -151,6 +151,7 @@ file._actuallyUploadDiscordFileToMxc = function(url, res) { throw new Error(`Not
 	require("../src/d2m/actions/register-user.test")
 	require("../src/d2m/converters/edit-to-changes.test")
 	require("../src/d2m/converters/activity-to-rpc.test")
+	require("../src/d2m/actions/sync-banner.test")
 	require("../src/d2m/converters/emoji-to-key.test")
 	require("../src/d2m/converters/find-mentions.test")
 	require("../src/d2m/converters/lottie.test")

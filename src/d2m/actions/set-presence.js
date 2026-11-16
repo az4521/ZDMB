@@ -104,6 +104,8 @@ class Presence extends sync.reloadClassMethods(() => Presence) {
 	/** @private @type {string | null} JSON of the entries last published, or null if the field is currently empty */ rpcPublished = null
 	/** @private @type {number} */ rpcLastPut = 0
 	/** @private @type {Promise<void>} serialises writes to the rich presence field */ rpcQueue = Promise.resolve()
+	/** @private @type {{text: string, emoji: string} | null} custom status from the latest activities, or null if there is none */ statusValue = null
+	/** @private @type {string | null} JSON of the status last published, or null if the status field is currently empty */ statusPublished = null
 	/** @private @type {boolean} set once this user has gone offline and the Presence is discarded */ dropped = false
 
 	constructor(userID) {
@@ -122,8 +124,36 @@ class Presence extends sync.reloadClassMethods(() => Presence) {
 			: "unavailable")
 		this.data = {presence}
 		this.activities = activities ?? []
+		this.statusValue = activityToRpc.activitiesToStatus(this.activities)
+		this.publishStatus()
 		// rpcEntries are replaced once icons have been uploaded, so that an icon-less version is never published first
 		this.updateRpc()
+	}
+
+	/**
+	 * Publishes the custom status field if it changed. Clears it once when the custom status disappears.
+	 * @private
+	 */
+	publishStatus() {
+		const mxid = this.lookupMxid()
+		if (!mxid || this.dropped) return
+
+		const json = this.statusValue === null ? null : JSON.stringify(this.statusValue)
+		if (json === this.statusPublished) return
+		if (json === null) return this.clearStatus(mxid)
+
+		this.statusPublished = json
+		this.enqueueField(mxid, activityToRpc.STATUS_FIELD, this.statusValue)
+	}
+
+	/**
+	 * Deletes the custom status field, if a status was published. Sends at most one DELETE until a status is published again.
+	 * @private
+	 * @param {string} mxid
+	 */
+	clearStatus(mxid) {
+		this.statusPublished = null
+		this.enqueueField(mxid, activityToRpc.STATUS_FIELD, null)
 	}
 
 	/**
@@ -183,9 +213,11 @@ class Presence extends sync.reloadClassMethods(() => Presence) {
 	 */
 	dropRpc() {
 		this.dropped = true
-		if (this.rpcPublished === null) return
+		if (this.rpcPublished === null && this.statusPublished === null) return
 		const mxid = this.lookupMxid()
-		if (mxid) this.clearRpc(mxid)
+		if (!mxid) return
+		if (this.rpcPublished !== null) this.clearRpc(mxid)
+		if (this.statusPublished !== null) this.clearStatus(mxid)
 	}
 
 	/**
@@ -196,8 +228,19 @@ class Presence extends sync.reloadClassMethods(() => Presence) {
 	 * @param {Record<string, any>[] | null} value entries to set, or null to delete the field
 	 */
 	enqueueRpc(mxid, value) {
+		this.enqueueField(mxid, activityToRpc.RPC_FIELD, value)
+	}
+
+	/**
+	 * Queues a PUT or DELETE of any profile field of this user, on the same queue as the rich presence field.
+	 * @private
+	 * @param {string} mxid
+	 * @param {string} field profile field key
+	 * @param {unknown} value value to set, or null to delete the field
+	 */
+	enqueueField(mxid, field, value) {
 		this.rpcQueue = this.rpcQueue
-			.then(() => api.profileSetField(mxid, activityToRpc.RPC_FIELD, value))
+			.then(() => api.profileSetField(mxid, field, value))
 			.catch(() => {})
 	}
 
@@ -216,6 +259,7 @@ class Presence extends sync.reloadClassMethods(() => Presence) {
 			api.setPresence(this.data, mxid).catch(() => {})
 		}, this.delay * presenceLoopInterval).unref()
 		this.publishRpc(true)
+		this.publishStatus()
 	}
 }
 

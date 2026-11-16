@@ -78,6 +78,13 @@ async function onPacket(client, message, listen) {
 			console.log(`ok, ${client.guilds.size} available.`)
 		}
 
+		if (listen === "full") {
+			// Users already in voice in this guild get the call field. This runs in the background so that startup isn't blocked.
+			/** @type {typeof import("./actions/voice-state")} */
+			const voiceState = sync.require("./actions/voice-state")
+			voiceState.voiceStateTracker.onGuildCreate(message.d, client.user.id).catch(() => {})
+		}
+
 		const arr = []
 		client.guildChannelMap.set(message.d.id, arr)
 		for (const channel of message.d.channels || []) {
@@ -213,7 +220,7 @@ async function onPacket(client, message, listen) {
 
 	// Event dispatcher for OOYE bridge operations
 	if (listen === "full" && message.t) {
-		const alwaysRealTimeEvents = ["PRESENCE_UPDATE"]
+		const alwaysRealTimeEvents = ["PRESENCE_UPDATE", "VOICE_STATE_UPDATE"]
 		const optionalEvents = ["TYPING_START"]
 		if (alwaysRealTimeEvents.includes(message.t) || homeserverStatus.homeserverStatus.isRealTime()) {
 			// real time

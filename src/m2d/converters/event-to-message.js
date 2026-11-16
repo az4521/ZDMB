@@ -526,6 +526,16 @@ function getFileSizeForGuild(guild) {
 }
 
 /**
+ * Matrix voice messages are m.audio events with a voice marker key. Discord webhooks cannot send real voice messages,
+ * so they are sent as ordinary audio file attachments.
+ * @param {any} content
+ * @param {string} msgtype
+ */
+function isVoiceMessageContent(content, msgtype) {
+	return msgtype === "m.audio" && ("org.matrix.msc3245.voice" in content || "m.voice" in content)
+}
+
+/**
  * Adds one file as an attachment to the message. If the file is too large for the guild, adds a link to the caption instead.
  * Used for the file of a single file message, and for each item of a gallery message.
  * @param {any} content the file's content. For a gallery item, this is the item, which has the same keys as file content.
@@ -545,6 +555,12 @@ function addFileToMessage(content, msgtype, guild, captionContent, attachments, 
 
 	// If filename is not specified, create one from mimetype
 	let filename = content.filename || content.body
+	const isVoice = isVoiceMessageContent(content, msgtype)
+	// mime-types maps audio/ogg to "oga", but voice messages from Discord are .ogg files
+	const voiceExtension = content.info?.mimetype === "audio/ogg" ? "ogg" : mimeTypes.extension(content.info?.mimetype)
+	if (isVoice && !content.filename && (!content.body || content.body === "Voice message") && voiceExtension) {
+		filename = `voice-message.${voiceExtension}`
+	}
 	if (!filename) {
 		const extension = mimeTypes.extension(content.info?.mimetype)
 		assert(extension, "Filename and mimetype missing. Please report this bug to your client.")
@@ -701,7 +717,8 @@ async function eventToMessage(event, guild, channel, di) {
 		const captionContent = new mxUtils.MatrixStringBuilder()
 
 		// Caption from Matrix message
-		const fileHasCaption = (event.content.body && event.content.filename && event.content.body !== event.content.filename) || event.content.formatted_body
+		const isVoice = isVoiceMessageContent(event.content, event.content.msgtype)
+		const fileHasCaption = (event.content.body && event.content.filename && event.content.body !== event.content.filename && !(isVoice && event.content.body === "Voice message")) || event.content.formatted_body
 		if (fileHasCaption) {
 			captionContent.addLine(event.content.body || "", event.content.formatted_body || tag`${event.content.body || ""}`)
 		}

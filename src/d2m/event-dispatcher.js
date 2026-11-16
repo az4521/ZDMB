@@ -41,6 +41,8 @@ const matrixEventDispatcher = sync.require("../m2d/event-dispatcher")
 const redact = sync.require("../m2d/actions/redact.js")
 /** @type {import("../discord/interactions/matrix-info")} */
 const matrixInfoInteraction = sync.require("../discord/interactions/matrix-info")
+/** @type {import("./actions/voice-state")} */
+const voiceState = sync.require("./actions/voice-state")
 
 const {Semaphore} = require("@chriscdn/promise-semaphore")
 const checkMissedPinsSema = sync.remember(() => new Semaphore())
@@ -461,5 +463,13 @@ module.exports = {
 		const status = data.status
 		if (!status) return
 		setPresence.presenceTracker.incomingPresence(data.user.id, data.guild_id, status, data.activities)
+	},
+
+	/**
+	 * @param {import("./discord-client")} client
+	 * @param {DiscordTypes.GatewayVoiceStateUpdateDispatchData} data
+	 */
+	VOICE_STATE_UPDATE(client, data) {
+		voiceState.voiceStateTracker.onVoiceState(data, client.user.id)
 	}
 }
