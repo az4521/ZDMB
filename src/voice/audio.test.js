@@ -166,9 +166,10 @@ test("audio: JitterBuffer stats() and reset()", t => {
 	jb.read(960)
 	jb.read(960)
 	jb.read(960) // empty: underrun
-	t.deepEqual(jb.stats(), {underrunReads: 1, droppedSamples: 0})
+	// Buffered depth at the four reads: 0, 40, 20, 0 ms
+	t.deepEqual(jb.stats(), {underrunReads: 1, droppedSamples: 0, bufferedSumMs: 60, bufferedReads: 4, bufferedMaxMs: 40})
 	jb.reset()
-	t.deepEqual(jb.stats(), {underrunReads: 0, droppedSamples: 0})
+	t.deepEqual(jb.stats(), {underrunReads: 0, droppedSamples: 0, bufferedSumMs: 0, bufferedReads: 0, bufferedMaxMs: 0})
 })
 
 test("audio: createOpusDecoder decodes an Opus packet produced by OpusScript's encoder", t => {

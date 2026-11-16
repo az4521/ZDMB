@@ -120,7 +120,7 @@ const mixMono = (frames, length) => {
  * - Soft cap: when a read finds more than `targetMaxMs` buffered (clock drift built up delay), the oldest samples are
  *   dropped down to `primeMs` before the read, so delay can't accumulate.
  * - read(n) always returns exactly n samples, zero-filled where the buffer ran dry.
- * - stats() counts underrun reads and dropped samples since the last reset().
+ * - stats() counts underrun reads and dropped samples since the last reset(), and samples bufferedMs at every read.
  */
 class JitterBuffer {
 	/** @type {number} */
@@ -140,6 +140,10 @@ class JitterBuffer {
 	#starvedSamples = 0
 	#underrunReads = 0
 	#droppedSamples = 0
+	/** Sum of bufferedMs over every read since reset(), one sample per read */
+	#bufferedSumMs = 0
+	#bufferedReads = 0
+	#bufferedMaxMs = 0
 
 	/**
 	 * @param {{maxMs?: number, primeMs?: number, targetMaxMs?: number, reprimeAfterMs?: number}} [options]
@@ -184,6 +188,7 @@ class JitterBuffer {
 	 */
 	read(n) {
 		const out = new Int16Array(n)
+		this.#sampleBufferedMs()
 		if (!this.#primed) {
 			if (this.#length < this.#primeSamples) return out
 			this.#primed = true
@@ -214,16 +219,36 @@ class JitterBuffer {
 		return out
 	}
 
+	/** Records how much audio is buffered at the start of a read. Never throws. */
+	#sampleBufferedMs() {
+		try {
+			const ms = this.bufferedMs
+			this.#bufferedSumMs += ms
+			this.#bufferedReads++
+			if (ms > this.#bufferedMaxMs) this.#bufferedMaxMs = ms
+		} catch (e) {}
+	}
+
 	/**
-	 * @returns {{underrunReads: number, droppedSamples: number}} counts since the last reset()
+	 * Counts since the last reset(). `bufferedSumMs / bufferedReads` is the average buffered depth seen by reads.
+	 * @returns {{underrunReads: number, droppedSamples: number, bufferedSumMs: number, bufferedReads: number, bufferedMaxMs: number}}
 	 */
 	stats() {
-		return {underrunReads: this.#underrunReads, droppedSamples: this.#droppedSamples}
+		return {
+			underrunReads: this.#underrunReads,
+			droppedSamples: this.#droppedSamples,
+			bufferedSumMs: this.#bufferedSumMs,
+			bufferedReads: this.#bufferedReads,
+			bufferedMaxMs: this.#bufferedMaxMs,
+		}
 	}
 
 	reset() {
 		this.#underrunReads = 0
 		this.#droppedSamples = 0
+		this.#bufferedSumMs = 0
+		this.#bufferedReads = 0
+		this.#bufferedMaxMs = 0
 	}
 }
 
@@ -247,18 +272,23 @@ class LiveOpusStream extends Readable {
 	#pull
 	/** @type {OpusEncoder} */
 	#encoder
+	/** @type {((queued: number) => void) | undefined} */
+	#onRead
 	#stopped = false
 
 	/**
 	 * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence. Must not block.
+	 * @param {{onRead?: (queued: number) => void}} [options] onRead gets the number of packets buffered at each _read()
 	 */
-	constructor(pull) {
+	constructor(pull, {onRead} = {}) {
 		super({objectMode: true, highWaterMark: 2})
 		this.#pull = pull
+		this.#onRead = onRead
 		this.#encoder = createOpusEncoder()
 	}
 
 	_read() {
+		this.#sampleQueued()
 		try {
 			while (!this.#stopped && this.push(this.#nextPacket())) {
 				// Keep producing until the buffer is at its high-water mark
@@ -287,6 +317,13 @@ class LiveOpusStream extends Readable {
 		if (this.#stopped) return
 		this.#stopped = true
 		this.push(null)
+	}
+
+	/** Reports how many packets are waiting for the player. Never affects audio. */
+	#sampleQueued() {
+		try {
+			this.#onRead?.(this.readableLength)
+		} catch (e) {}
 	}
 
 	/** @returns {Buffer} */

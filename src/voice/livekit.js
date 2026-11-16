@@ -120,8 +120,52 @@ class Publisher {
 		this.closed = false
 		/** Frames handed to captureFrame or waiting to be, in 10 ms units. */
 		this.pending = 0
+		/** Counters for stats(), since the last reset() */
+		this.queuedSumMs = 0
+		this.queuedSamples = 0
+		this.queuedMaxMs = 0
+		this.pendingMax = this.pending
+		this.dropped = 0
 		/** @type {Promise<void>} */
 		this.queue = Promise.resolve()
+	}
+
+	/**
+	 * Counters since the last reset(). queuedAvgMs is averaged over queuedSamples, one sample per captured frame.
+	 * pendingMax counts 10 ms capture frames. dropped counts pushMono calls that were refused for being behind.
+	 * @returns {{queuedAvgMs: number, queuedMaxMs: number, queuedSamples: number, queuedSumMs: number, pendingMax: number, dropped: number}}
+	 */
+	stats() {
+		return {
+			queuedAvgMs: this.queuedSamples ? this.queuedSumMs / this.queuedSamples : 0,
+			queuedMaxMs: this.queuedMaxMs,
+			queuedSamples: this.queuedSamples,
+			queuedSumMs: this.queuedSumMs,
+			pendingMax: this.pendingMax,
+			dropped: this.dropped,
+		}
+	}
+
+	reset() {
+		this.queuedSumMs = 0
+		this.queuedSamples = 0
+		this.queuedMaxMs = 0
+		this.pendingMax = this.pending
+		this.dropped = 0
+	}
+
+	/**
+	 * Records the AudioSource's queued audio after a capture. Never throws.
+	 * @param {any} source
+	 */
+	#sampleQueued(source) {
+		try {
+			const ms = source.queuedDuration
+			if (typeof ms !== "number" || !Number.isFinite(ms)) return
+			this.queuedSumMs += ms
+			this.queuedSamples++
+			if (ms > this.queuedMaxMs) this.queuedMaxMs = ms
+		} catch (e) {}
 	}
 
 	async connect() {
@@ -151,16 +195,24 @@ class Publisher {
 		if (samples.length !== CHUNK_SAMPLES) throw new Error(`pushMono expects ${CHUNK_SAMPLES} samples, got ${samples.length}`)
 		const source = this.source
 		if (!this.connected || this.closed || !source) return
-		if (this.pending >= MAX_PENDING_FRAMES) return
-		if (typeof source.queuedDuration === "number" && source.queuedDuration > MAX_BEHIND_MS) return
+		if (this.pending >= MAX_PENDING_FRAMES) {
+			this.dropped++
+			return
+		}
+		if (typeof source.queuedDuration === "number" && source.queuedDuration > MAX_BEHIND_MS) {
+			this.dropped++
+			return
+		}
 
 		const rtc = this.rtc
 		for (let half = 0; half < 2; half++) {
 			const data = samples.slice(half * HALF_CHUNK_SAMPLES, (half + 1) * HALF_CHUNK_SAMPLES)
 			const frame = new rtc.AudioFrame(data, SAMPLE_RATE, CHANNELS, HALF_CHUNK_SAMPLES)
 			this.pending++
+			if (this.pending > this.pendingMax) this.pendingMax = this.pending
 			this.queue = this.queue
 				.then(() => source.captureFrame(frame))
+				.then(() => this.#sampleQueued(source))
 				.catch(() => {}) // source closed or errored: nothing useful to do with this frame
 				.finally(() => { this.pending-- })
 		}

@@ -56,10 +56,25 @@ const loggedConnections = new WeakSet()
 
 /**
  * Per-channel counters for the summary line, reset every STATS_INTERVAL_MS.
- * @returns {{matrixAudio: number, discordFrames: number, anchor: {nonSilent: number, silent: number}, puppet: {nonSilent: number, silent: number}}}
+ * @returns {{matrixAudio: number, discordFrames: number, anchor: {nonSilent: number, silent: number}, puppet: {nonSilent: number, silent: number}, decode: {sumMs: number, count: number, maxMs: number}, opusQueueMax: number}}
  */
 function newStats() {
-	return {matrixAudio: 0, discordFrames: 0, anchor: {nonSilent: 0, silent: 0}, puppet: {nonSilent: 0, silent: 0}}
+	return {
+		matrixAudio: 0,
+		discordFrames: 0,
+		anchor: {nonSilent: 0, silent: 0},
+		puppet: {nonSilent: 0, silent: 0},
+		decode: {sumMs: 0, count: 0, maxMs: 0},
+		opusQueueMax: 0,
+	}
+}
+
+/**
+ * @param {number} ms
+ * @returns {string} one decimal place
+ */
+function fmtMs(ms) {
+	return Number.isFinite(ms) ? ms.toFixed(1) : "0.0"
 }
 
 /**
@@ -220,9 +235,10 @@ function isVoiceChannel(channelID) {
  * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence. Must not block.
  * @param {string} label who this audio is for, used in log lines
  * @param {() => boolean} isWanted whether the owner still wants this audio playing
+ * @param {(queued: number) => void} [onQueued] gets the number of Opus packets waiting at each read of the stream
  * @returns {PcmPlayback}
  */
-function playPcm(connection, pull, label, isWanted) {
+function playPcm(connection, pull, label, isWanted, onQueued) {
 	const voice = _deps.voiceLib()
 	let stopped = false
 	/** @type {any} the current player */
@@ -237,7 +253,7 @@ function playPcm(connection, pull, label, isWanted) {
 	function start() {
 		startedAt = Date.now()
 		const currentPlayer = voice.createAudioPlayer({behaviors: {noSubscriber: voice.NoSubscriberBehavior.Play, maxMissedFrames: MAX_MISSED_FRAMES}})
-		const currentStream = new audio.LiveOpusStream(pull)
+		const currentStream = new audio.LiveOpusStream(pull, {onRead: onQueued})
 		player = currentPlayer
 		stream = currentStream
 		attachLogging(() => {
@@ -537,7 +553,7 @@ class ChannelBridge {
 				}
 			}
 			connection.receiver.speaking.on("start", this.onStart)
-			this.anchorPlayback = playPcm(connection, () => this.pullOverflow(), `anchor ${anchor.userID} in ${this.channelID}`, () => this.active && this.connection === connection)
+			this.anchorPlayback = playPcm(connection, () => this.pullOverflow(), `anchor ${anchor.userID} in ${this.channelID}`, () => this.active && this.connection === connection, queued => this.countOpusQueue(queued))
 			this.active = true
 			this.startStatsTimer()
 
@@ -689,9 +705,11 @@ class ChannelBridge {
 			if (this.speakers.get(userID) === speaker) this.speakers.delete(userID)
 		}
 		opus.on("data", (/** @type {Buffer} */ packet) => {
+			const arrived = performance.now()
 			try {
 				entry.publisher.pushMono(audio.stereoToMono(entry.decoder.decode(packet)))
 				this.stats.discordFrames++
+				this.countDecode(arrived)
 			} catch (e) {
 				// A single bad packet is dropped
 			}
@@ -758,7 +776,7 @@ class ChannelBridge {
 					const mono = participantFrame(participant)
 					this.countFrame("puppet", mono)
 					return audio.monoToStereo(mono)
-				}, `puppet ${bot.userID} for ${participant.mxid}`, () => !participant.ended)
+				}, `puppet ${bot.userID} for ${participant.mxid}`, () => !participant.ended, queued => this.countOpusQueue(queued))
 				console.log(`[voice] ${participant.mxid} is on dedicated puppet ${bot.userID}`)
 				return
 			}
@@ -953,6 +971,56 @@ class ChannelBridge {
 		} catch (e) {}
 	}
 
+	/**
+	 * Counts the time from a Discord Opus packet arriving to its decoded audio being queued on the publisher. Never throws.
+	 * @param {number} arrived performance.now() when the packet arrived
+	 */
+	countDecode(arrived) {
+		try {
+			const ms = performance.now() - arrived
+			const decode = this.stats.decode
+			decode.sumMs += ms
+			decode.count++
+			if (ms > decode.maxMs) decode.maxMs = ms
+		} catch (e) {}
+	}
+
+	/**
+	 * Records how many Opus packets are waiting for an anchor or puppet player. Never throws.
+	 * @param {number} queued
+	 */
+	countOpusQueue(queued) {
+		try {
+			if (queued > this.stats.opusQueueMax) this.stats.opusQueueMax = queued
+		} catch (e) {}
+	}
+
+	/**
+	 * Takes and resets the publisher counters of every Discord human in this channel. Never throws.
+	 * @returns {{queueAvgMs: number, queueMaxMs: number, pendingMax: number, dropped: number}}
+	 */
+	drainPublisherStats() {
+		let queueSumMs = 0
+		let queueSamples = 0
+		let queueMaxMs = 0
+		let pendingMax = 0
+		let dropped = 0
+		for (const entry of this.publishers.values()) {
+			try {
+				const publisher = entry.publisher
+				if (typeof publisher.stats !== "function") continue
+				const s = publisher.stats()
+				queueSumMs += s.queuedSumMs
+				queueSamples += s.queuedSamples
+				if (s.queuedMaxMs > queueMaxMs) queueMaxMs = s.queuedMaxMs
+				if (s.pendingMax > pendingMax) pendingMax = s.pendingMax
+				dropped += s.dropped
+				publisher.reset()
+			} catch (e) {}
+		}
+		return {queueAvgMs: queueSamples ? queueSumMs / queueSamples : 0, queueMaxMs, pendingMax, dropped}
+	}
+
 	startStatsTimer() {
 		this.stopStatsTimer()
 		this.statsTimer = setInterval(() => this.logStats(), STATS_INTERVAL_MS)
@@ -973,14 +1041,22 @@ class ChannelBridge {
 			this.stats = newStats()
 			let underrunReads = 0
 			let droppedSamples = 0
+			let bufferedSumMs = 0
+			let bufferedReads = 0
+			let bufferedMaxMs = 0
 			for (const participant of this.participants.values()) {
 				const buffer = participant.buffer.stats()
 				underrunReads += buffer.underrunReads
 				droppedSamples += buffer.droppedSamples
+				bufferedSumMs += buffer.bufferedSumMs
+				bufferedReads += buffer.bufferedReads
+				if (buffer.bufferedMaxMs > bufferedMaxMs) bufferedMaxMs = buffer.bufferedMaxMs
 				participant.buffer.reset()
 			}
+			const publisher = this.drainPublisherStats()
+			const decode = stats.decode
 			const seconds = STATS_INTERVAL_MS / 1000
-			console.log(`[voice] ${this.channelID} last ${seconds}s: matrixParticipants=${this.participants.size} matrixAudioFrames=${stats.matrixAudio} jitterUnderrunReads=${underrunReads} jitterDroppedSamples=${droppedSamples} anchor(nonSilent=${stats.anchor.nonSilent} silent=${stats.anchor.silent}) puppets(nonSilent=${stats.puppet.nonSilent} silent=${stats.puppet.silent}) discordFramesToPublishers=${stats.discordFrames}`)
+			console.log(`[voice] ${this.channelID} last ${seconds}s: matrixParticipants=${this.participants.size} matrixAudioFrames=${stats.matrixAudio} jitterUnderrunReads=${underrunReads} jitterDroppedSamples=${droppedSamples} jitterAvgMs=${fmtMs(bufferedReads ? bufferedSumMs / bufferedReads : 0)} jitterMaxMs=${fmtMs(bufferedMaxMs)} anchor(nonSilent=${stats.anchor.nonSilent} silent=${stats.anchor.silent}) puppets(nonSilent=${stats.puppet.nonSilent} silent=${stats.puppet.silent}) discordFramesToPublishers=${stats.discordFrames} publisherQueueAvgMs=${fmtMs(publisher.queueAvgMs)} publisherQueueMaxMs=${fmtMs(publisher.queueMaxMs)} publisherPendingMax=${publisher.pendingMax} publisherDropped=${publisher.dropped} decodeAvgMs=${fmtMs(decode.count ? decode.sumMs / decode.count : 0)} decodeMaxMs=${fmtMs(decode.maxMs)} opusQueueMax=${stats.opusQueueMax}`)
 		} catch (e) {}
 	}
 }
