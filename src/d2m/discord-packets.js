@@ -3,6 +3,7 @@
 const assert = require("assert").strict
 const {scheduler} = require("timers/promises")
 const passthrough = require("../passthrough")
+const {reg} = require("../matrix/read-registration")
 const {sync} = passthrough
 
 /** @type {import("../matrix/homeserver-status")} */
@@ -216,6 +217,16 @@ async function onPacket(client, message, listen) {
 				const previous = channels.indexOf(message.d.id)
 				if (previous !== -1) channels.splice(previous, 1)
 			}
+		}
+	}
+
+	// Voice bridge: the main bot's voice packets are handled here in real time, before any queueing, because VOICE_SERVER_UPDATE can't be replayed later
+	if (reg.ooye.voice_bridge && (message.t === "VOICE_STATE_UPDATE" || message.t === "VOICE_SERVER_UPDATE")) {
+		try {
+			require("../voice/discord-bots").onMainBotPacket(message)
+			if (message.t === "VOICE_STATE_UPDATE") require("../voice/bridge").onDiscordVoiceState(message.d)
+		} catch (e) {
+			console.error("[voice] failed to route a voice packet:", e)
 		}
 	}
 

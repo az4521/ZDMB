@@ -35,6 +35,23 @@ Because the category, channel and thread information is on the `m.space.child` e
 
 In self-service servers (where rooms are linked by hand), ZDMB leaves your own arrangement of channel rooms in the space alone, so channel order, categories and the space-side channel tags only apply to threads there.
 
+### Voice channels
+
+Bridged voice channels can be bridged live to Matrix calls (MatrixRTC with a LiveKit SFU, as used by Zam and Element Call). Audio only: Discord's bot API can't send or receive video or screen shares.
+
+* Each Discord speaker joins the Matrix call as their own bridged account, with their own audio track.
+* Matrix speakers are played into Discord by bots. Each Matrix speaker gets their own "puppet" bot (nicknamed after them) while there are free ones; anyone beyond that is mixed through the main bot.
+* A channel is bridged while anyone is in it on either side, and the bots leave when everyone has.
+
+It's off by default. To turn it on, add to the `ooye` section of `registration.yaml`:
+
+```yaml
+voice_bridge: true
+voice_puppet_tokens: ["<extra bot token>", "<another bot token>"]  # optional
+```
+
+Each puppet is a separate Discord bot application; invite every puppet to your servers with the View Channel, Connect, Speak and Change Nickname permissions. With no puppets, the main bot can bridge one voice channel per server at a time and plays all Matrix speakers mixed together. Your homeserver must advertise a LiveKit server (`org.matrix.msc4143.rtc_foci` in `.well-known/matrix/client`). Voice bridging uses native packages (`@discordjs/voice`, `@livekit/rtc-node`), installed by `npm install` as optional dependencies on Linux x64 (glibc) and Windows x64. Stage channels aren't supported yet.
+
 ## Requirements
 
 * Everything OOYE needs ([installation instructions](https://docs.ooye.org/for-hosters/install/)).

@@ -51,6 +51,21 @@ sync.require("./src/m2d/event-dispatcher")
 
 	discord.cloud.once("ready", () => {
 		as.listen()
+
+		if (reg.ooye.voice_bridge) {
+			const voiceBridge = require("./src/voice/bridge")
+			voiceBridge.start().catch(e => console.error("[voice] failed to start:", e))
+			// Tear down the calls cleanly, then exit as the signal would have
+			for (const signal of ["SIGINT", "SIGTERM"]) {
+				process.once(signal, () => {
+					const timeout = setTimeout(() => process.exit(), 3000)
+					voiceBridge.stop().catch(e => console.error("[voice] failed to stop:", e)).finally(() => {
+						clearTimeout(timeout)
+						process.exit()
+					})
+				})
+			}
+		}
 	})
 
 	require("./src/stdin")

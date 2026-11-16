@@ -371,6 +371,16 @@ async event => {
 	}
 }))
 
+/**
+ * @param {any} event a call member state event
+ */
+async function onCallMemberEvent(event) {
+	if (!reg.ooye.voice_bridge) return
+	require("../voice/bridge").onMatrixCallMemberEvent(event)
+}
+sync.addTemporaryListener(as, "type:org.matrix.msc3401.call.member", guard("org.matrix.msc3401.call.member", onCallMemberEvent))
+sync.addTemporaryListener(as, "type:m.call.member", guard("m.call.member", onCallMemberEvent))
+
 sync.addTemporaryListener(as, "type:m.room.member", guard("m.room.member",
 /**
  * @param {Ty.Event.StateOuter<Ty.Event.M_Room_Member>} event
