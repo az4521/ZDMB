@@ -48,6 +48,9 @@ const THREAD_TYPES = [DiscordTypes.ChannelType.PublicThread, DiscordTypes.Channe
 /** Custom state type that tells the Zam client which room a thread belongs to. */
 const THREAD_PARENT_STATE_TYPE = "moe.crafty.zdmb.thread_parent"
 
+/** Custom key on the m.space.child event that tells the Zam client which Discord category a channel is in. */
+const CATEGORY_STATE_TYPE = "moe.crafty.zdmb.category"
+
 /** @type {Map<string, Promise<string>>} channel ID -> Promise<room ID> */
 const inflightRoomCreate = sync.remember(() => new Map())
 
@@ -354,6 +357,21 @@ function padOrder(value, width) {
 }
 
 /**
+ * Builds the `moe.crafty.zdmb.category` content for the m.space.child event of a channel: the Discord category it is in.
+ * Threads are left out, since they already have the thread parent. A category that isn't cached gives no content.
+ * @param {{id: string, type: number, parent_id?: string | null}} channel
+ * @returns {{id: string, name: string} | null}
+ */
+function channelToCategoryContent(channel) {
+	if (THREAD_TYPES.includes(channel.type)) return null
+	if (!channel.parent_id) return null
+	// @ts-ignore
+	const category = discord.channels.get(channel.parent_id)
+	if (category?.type !== DiscordTypes.ChannelType.GuildCategory) return null
+	return {id: category.id, name: category.name}
+}
+
+/**
  * Matrix spaces sort their children by the `order` string of each m.space.child event (lexicographic, max 50 printable ASCII chars).
  * This mirrors Discord's channel list: uncategorised channels first, then by category position, then text before voice, then by channel position.
  * Threads sort directly after their parent channel. Forum and media threads are grouped by their own space, so they have no order.
@@ -642,7 +660,7 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 	}
 
 	const spaceKState = await ks.roomToKState(spaceID)
-	/** @type {{via?: string[], order?: string, "moe.crafty.zdmb.thread_parent"?: {room_id: string, event_id?: string}}} */
+	/** @type {{via?: string[], order?: string, "moe.crafty.zdmb.thread_parent"?: {room_id: string, event_id?: string}, "moe.crafty.zdmb.category"?: {id: string, name: string}}} */
 	let spaceEventContent = {}
 	if (
 		channel.type !== DiscordTypes.ChannelType.PrivateThread // private threads do not belong in the space (don't offer people something they can't join)
@@ -658,6 +676,8 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 		if (typeof order === "string") spaceEventContent.order = order
 		const threadParent = threadParentSpaceContent(channel)
 		if (threadParent) spaceEventContent[THREAD_PARENT_STATE_TYPE] = threadParent
+		const category = channelToCategoryContent(channel)
+		if (category) spaceEventContent[CATEGORY_STATE_TYPE] = category
 	}
 	const spaceDiff = ks.diffKState(spaceKState, {
 		[`m.space.child/${roomID}`]: spaceEventContent
@@ -713,6 +733,9 @@ async function syncSpaceOrder(guildID) {
 			if (order !== undefined) content.order = order
 			const threadParent = threadParentSpaceContent(channel)
 			if (threadParent) content[THREAD_PARENT_STATE_TYPE] = threadParent
+			const category = channelToCategoryContent(channel)
+			if (category) content[CATEGORY_STATE_TYPE] = category
+			else delete content[CATEGORY_STATE_TYPE] // moved out of a category, or its category is gone
 			if (isDeepStrictEqual(content, existing)) continue
 			target[key] = content
 		}
@@ -796,6 +819,7 @@ module.exports._convertNameAndTopic = convertNameAndTopic
 module.exports._syncSpaceMember = _syncSpaceMember
 module.exports.unbridgeChannel = unbridgeChannel
 module.exports.channelToSpaceOrder = channelToSpaceOrder
+module.exports.channelToCategoryContent = channelToCategoryContent
 module.exports.syncCategoryChildrenOrder = syncCategoryChildrenOrder
 module.exports.syncSpaceOrder = syncSpaceOrder
 module.exports.threadParentContent = threadParentContent

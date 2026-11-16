@@ -307,6 +307,11 @@ module.exports = {
 	async CHANNEL_DELETE(client, channel) {
 		const guildID = channel["guild_id"]
 		if (!guildID) return // channel must have been a DM channel or something
+		// A deleted category has no room, but its channels are now uncategorised, so update their category key and order in the space
+		if (channel.type === DiscordTypes.ChannelType.GuildCategory) {
+			await createRoom.syncSpaceOrder(guildID)
+			return
+		}
 		const roomID = select("channel_room", "room_id", {channel_id: channel.id}).pluck().get()
 		if (!roomID) return // channel wasn't being bridged in the first place
 		await createRoom.unbridgeChannel(channel, guildID)
