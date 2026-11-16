@@ -1,7 +1,7 @@
 // @ts-check
 
 const mixin = require("@cloudrac3r/mixin-deep")
-const {channelToKState, _convertNameAndTopic, channelToSpaceOrder, channelToCategoryContent, syncSpaceOrder, threadParentContent, syncThreadParents, _syncSpaceMember} = require("./create-room")
+const {channelToKState, _convertNameAndTopic, channelToSpaceOrder, channelToCategoryContent, syncSpaceOrder, threadParentContent, syncRoomMarkers, channelToChannelTag, _syncSpaceMember} = require("./create-room")
 const api = require("../../matrix/api")
 const {kstateStripConditionals} = require("../../matrix/kstate")
 const {test} = require("supertape")
@@ -43,12 +43,15 @@ function mockAPI(t) {
 	}
 }
 
+/** The channel state that every general channel room has, on top of testData.room.general */
+const generalTag = {"moe.crafty.zdmb.channel/": {type: "text", name: testData.room.general["m.room.name/"].name}}
+
 test("channel2room: discoverable privacy room", async t => {
 	const api = mockAPI(t)
 	db.prepare("UPDATE guild_space SET privacy_level = 2").run()
 	t.deepEqual(
 		kstateStripConditionals(await channelToKState(testData.channel.general, testData.guild.general, {api}).then(x => x.channelKState)),
-		Object.assign({}, testData.room.general, {
+		Object.assign({}, testData.room.general, generalTag, {
 			"m.room.guest_access/": {guest_access: "forbidden"},
 			"m.room.join_rules/": {join_rule: "public"},
 			"m.room.history_visibility/": {history_visibility: "world_readable"},
@@ -63,7 +66,7 @@ test("channel2room: linkable privacy room", async t => {
 	db.prepare("UPDATE guild_space SET privacy_level = 1").run()
 	t.deepEqual(
 		kstateStripConditionals(await channelToKState(testData.channel.general, testData.guild.general, {api}).then(x => x.channelKState)),
-		Object.assign({}, testData.room.general, {
+		Object.assign({}, testData.room.general, generalTag, {
 			"m.room.guest_access/": {guest_access: "forbidden"},
 			"m.room.join_rules/": {join_rule: "public"},
 			"m.room.power_levels/": mixin({users: {"@example:matrix.org": 50}}, testData.room.general["m.room.power_levels/"])
@@ -77,7 +80,7 @@ test("channel2room: invite-only privacy room", async t => {
 	db.prepare("UPDATE guild_space SET privacy_level = 0").run()
 	t.deepEqual(
 		kstateStripConditionals(await channelToKState(testData.channel.general, testData.guild.general, {api}).then(x => x.channelKState)),
-		Object.assign({}, testData.room.general, {
+		Object.assign({}, testData.room.general, generalTag, {
 			"m.room.power_levels/": mixin({users: {"@example:matrix.org": 50}}, testData.room.general["m.room.power_levels/"])
 		})
 	)
@@ -88,7 +91,7 @@ test("channel2room: room where limited people can mention everyone", async t => 
 	const api = mockAPI(t)
 	const limitedGuild = mixin({}, testData.guild.general)
 	limitedGuild.roles[0].permissions = (BigInt(limitedGuild.roles[0].permissions) - 131072n).toString()
-	const limitedRoom = mixin({}, testData.room.general, {"m.room.power_levels/": {
+	const limitedRoom = mixin({}, testData.room.general, generalTag, {"m.room.power_levels/": {
 		notifications: {room: 20},
 		users: {"@example:matrix.org": 50}
 	}})
@@ -102,7 +105,7 @@ test("channel2room: room where limited people can mention everyone", async t => 
 test("channel2room: matrix room that already has a custom topic set", async t => {
 	const api = mockAPI(t)
 	db.prepare("UPDATE channel_room SET custom_topic = 1 WHERE channel_id = ?").run(testData.channel.general.id)
-	const expected = mixin({}, testData.room.general, {"m.room.power_levels/": {notifications: {room: 20}, users: {"@example:matrix.org": 50}}})
+	const expected = mixin({}, testData.room.general, generalTag, {"m.room.power_levels/": {notifications: {room: 20}, users: {"@example:matrix.org": 50}}})
 	// @ts-ignore
 	delete expected["m.room.topic/"]
 	t.deepEqual(
@@ -165,6 +168,7 @@ test("channel2room: read-only discord channel", async t => {
 				"cadence.moe",
 			],
 		},
+		"moe.crafty.zdmb.channel/": {type: "text", name: "updates"},
 		"uk.half-shot.bridge/moe.cadence.ooye://discord/112760669178241024/1161864271370666075": {
 			bridgebot: "@_ooye_bot:cadence.moe",
 			channel: {
@@ -196,6 +200,7 @@ test("channel2room: voice channel", async t => {
 	const api = mockAPI(t)
 	const state = kstateStripConditionals(await channelToKState(testData.channel.voice, testData.guild.general, {api}).then(x => x.channelKState))
 	t.equal(state["m.room.create/"].type, "org.matrix.msc3417.call")
+	t.deepEqual(state["moe.crafty.zdmb.channel/"], {type: "voice", name: testData.channel.voice.name})
 	t.deepEqual(state["org.matrix.msc3401.call/"], {
 		"m.intent": "m.room",
 		"m.name": "🍞丨[8user] Piece",
@@ -269,6 +274,7 @@ function withCachedChannels(channels, callback) {
 
 const orderCategory = {id: "700000000000000001", type: 4, position: 3, name: "Category"} // GuildCategory, so its children are shown at position 4
 const categoryType = "moe.crafty.zdmb.category"
+const channelType = "moe.crafty.zdmb.channel"
 
 test("channelToCategoryContent: channel in a category gets the category", t => {
 	const category = {id: "700000000000000041", type: 4, position: 0, name: "Voice Chat"}
@@ -397,7 +403,7 @@ test("syncSpaceOrder: fills in a missing order, leaves correct and removed child
 				// A: in the space with via, but no order or category yet
 				{type: "m.space.child", state_key: roomA, content: {via: ["cadence.moe"]}},
 				// B: in the space with the correct order and category already
-				{type: "m.space.child", state_key: roomB, content: {via: ["cadence.moe"], order: orderB, [categoryType]: categoryContent}},
+				{type: "m.space.child", state_key: roomB, content: {via: ["cadence.moe"], order: orderB, [categoryType]: categoryContent, [channelType]: {type: "text", name: "b"}}},
 				// D: removed from the space (empty content)
 				{type: "m.space.child", state_key: roomD, content: {}}
 			]
@@ -414,7 +420,7 @@ test("syncSpaceOrder: fills in a missing order, leaves correct and removed child
 			roomID: spaceID,
 			type: "m.space.child",
 			stateKey: roomA,
-			content: {via: ["cadence.moe"], order: orderA, [categoryType]: categoryContent}
+			content: {via: ["cadence.moe"], order: orderA, [categoryType]: categoryContent, [channelType]: {type: "text", name: "a"}}
 		}])
 	} finally {
 		api.getAllState = realGetAllState
@@ -462,6 +468,26 @@ function sortSent(list) {
 	return [...list].sort((a, b) => `${a.roomID} ${a.stateKey}`.localeCompare(`${b.roomID} ${b.stateKey}`))
 }
 
+test("channelToChannelTag: each channel type that has a tag gets its type and the channel name", t => {
+	t.deepEqual(channelToChannelTag({type: 0, name: "text"}, null), {type: "text", name: "text"})
+	t.deepEqual(channelToChannelTag(testData.channel.voice, null), {type: "voice", name: testData.channel.voice.name})
+	t.deepEqual(channelToChannelTag({type: 13, name: "stage"}, null), {type: "stage", name: "stage"})
+	t.deepEqual(channelToChannelTag({type: 5, name: "news"}, null), {type: "announcement", name: "news"})
+	t.deepEqual(channelToChannelTag({type: 15, name: "forum"}, null), {type: "forum", name: "forum"})
+	t.deepEqual(channelToChannelTag({type: 16, name: "media"}, null), {type: "media", name: "media"})
+	t.deepEqual(channelToChannelTag({type: 11, name: "thread"}, null), {type: "public_thread", name: "thread"})
+	t.deepEqual(channelToChannelTag({type: 12, name: "private"}, null), {type: "private_thread", name: "private"})
+	t.deepEqual(channelToChannelTag({type: 10, name: "announce thread"}, null), {type: "announcement_thread", name: "announce thread"})
+})
+
+test("channelToChannelTag: custom nick is used as the name", t => {
+	t.deepEqual(channelToChannelTag({type: 0, name: "text"}, "Custom"), {type: "text", name: "Custom"})
+})
+
+test("channelToChannelTag: channel types without a tag have no tag", t => {
+	t.equal(channelToChannelTag({type: 4, name: "category"}, null), null) // category
+})
+
 test("threadParentContent: thread gets its parent room and the event of its starter message", t => {
 	insertStarterMessage()
 	try {
@@ -507,7 +533,7 @@ test("channel2room: thread whose parent has no room has no thread parent state",
 	t.equal(state[threadParentKey], undefined)
 })
 
-test("syncThreadParents: sends the state only to thread rooms where it is missing or different", async t => {
+test("syncRoomMarkers: sends the markers only where they are missing or different, reading only the events each room needs", async t => {
 	const guildID = "999000000000000006"
 	const parentChannelID = "700000000000000201"
 	const parentRoom = "!tpparent:cadence.moe"
@@ -515,31 +541,54 @@ test("syncThreadParents: sends the state only to thread rooms where it is missin
 	const okRoom = "!tpok:cadence.moe"
 	const uncachedRoom = "!tpuncached:cadence.moe"
 	const textRoom = "!tptext:cadence.moe"
+	const nickRoom = "!tpnick:cadence.moe"
+	const uncachedTextRoom = "!tpuncachedtext:cadence.moe"
 	const parentChannel = {id: parentChannelID, type: 0, name: "parent", parent_id: null, guild_id: guildID}
 	const missingThread = {id: "700000000000000202", type: 11, name: "missing", parent_id: parentChannelID, guild_id: guildID}
 	const okThread = {id: "700000000000000203", type: 11, name: "ok", parent_id: parentChannelID, guild_id: guildID}
 	const textChannel = {id: "700000000000000205", type: 0, name: "text", parent_id: null, guild_id: guildID}
+	const nickChannel = {id: "700000000000000207", type: 0, name: "nicked", parent_id: null, guild_id: guildID}
 	const uncachedThreadID = "700000000000000204" // not in the Discord cache, so its parent comes from thread_parent
-	const expected = {room_id: parentRoom, via: ["cadence.moe"]}
+	const uncachedTextID = "700000000000000206" // not in the Discord cache, and not a thread, so its type is unknown
+	const threadContent = {room_id: parentRoom, via: ["cadence.moe"]}
+	const parentTag = {type: "text", name: "parent"}
+	const threadTag = {type: "public_thread", name: "missing"}
 
 	const realGetStateEvent = api.getStateEvent
 	const realSendState = api.sendState
 	const sent = []
+	/** @type {string[]} */
+	const reads = []
+	/** @type {Record<string, Record<string, any>>} room ID -> type -> content, for the events that exist */
+	const states = {
+		[parentRoom]: {},
+		[missingRoom]: {},
+		[okRoom]: { // both markers already correct
+			[threadParentType]: threadContent,
+			[channelType]: {type: "public_thread", name: "ok"}
+		},
+		[uncachedRoom]: {},
+		[textRoom]: {[channelType]: {type: "text", name: "text"}},
+		[nickRoom]: {}
+	}
 	db.prepare("INSERT INTO guild_active (guild_id, autocreate) VALUES (?, 1)").run(guildID)
-	const insertRoom = db.prepare("INSERT INTO channel_room (channel_id, room_id, name, nick, thread_parent, guild_id) VALUES (?, ?, ?, NULL, ?, ?)")
-	insertRoom.run(parentChannelID, parentRoom, "parent", null, guildID)
-	insertRoom.run(missingThread.id, missingRoom, "missing", null, guildID)
-	insertRoom.run(okThread.id, okRoom, "ok", null, guildID)
-	insertRoom.run(uncachedThreadID, uncachedRoom, "uncached", parentChannelID, guildID)
-	insertRoom.run(textChannel.id, textRoom, "text", null, guildID)
-	const cached = [parentChannel, missingThread, okThread, textChannel]
+	const insertRoom = db.prepare("INSERT INTO channel_room (channel_id, room_id, name, nick, thread_parent, guild_id) VALUES (?, ?, ?, ?, ?, ?)")
+	insertRoom.run(parentChannelID, parentRoom, "parent", null, null, guildID)
+	insertRoom.run(missingThread.id, missingRoom, "missing", null, null, guildID)
+	insertRoom.run(okThread.id, okRoom, "ok", null, null, guildID)
+	insertRoom.run(uncachedThreadID, uncachedRoom, "uncached", null, parentChannelID, guildID)
+	insertRoom.run(textChannel.id, textRoom, "text", null, null, guildID)
+	insertRoom.run(nickChannel.id, nickRoom, "nicked", "Custom nick", null, guildID)
+	insertRoom.run(uncachedTextID, uncachedTextRoom, "uncachedtext", null, null, guildID)
+	const cached = [parentChannel, missingThread, okThread, textChannel, nickChannel]
 	for (const channel of cached) discord.channels.set(channel.id, channel)
 	try {
 		// @ts-ignore
 		api.getStateEvent = async (roomID, type, key) => {
-			t.equal(type, threadParentType)
 			t.equal(key, "")
-			if (roomID === okRoom) return expected
+			reads.push(`${roomID} ${type}`)
+			const content = states[roomID]?.[type]
+			if (content) return content
 			throw new Error("M_NOT_FOUND")
 		}
 		// @ts-ignore
@@ -548,12 +597,28 @@ test("syncThreadParents: sends the state only to thread rooms where it is missin
 			return "$event"
 		}
 
-		await syncThreadParents(guildID)
+		await syncRoomMarkers(guildID)
 
-		t.deepEqual(sent, [
-			{roomID: missingRoom, type: threadParentType, stateKey: "", content: expected},
-			{roomID: uncachedRoom, type: threadParentType, stateKey: "", content: expected}
-		])
+		// only the event types each room needs are read, and none at all for the uncached non-thread row (its type is unknown)
+		t.deepEqual(reads.slice().sort(), [
+			`${missingRoom} ${channelType}`,
+			`${missingRoom} ${threadParentType}`,
+			`${nickRoom} ${channelType}`,
+			`${okRoom} ${channelType}`,
+			`${okRoom} ${threadParentType}`,
+			`${parentRoom} ${channelType}`,
+			`${textRoom} ${channelType}`,
+			`${uncachedRoom} ${channelType}`,
+			`${uncachedRoom} ${threadParentType}`
+		].sort())
+		t.deepEqual(sortSent(sent), sortSent([
+			{roomID: parentRoom, type: channelType, stateKey: "", content: parentTag},
+			{roomID: missingRoom, type: threadParentType, stateKey: "", content: threadContent},
+			{roomID: missingRoom, type: channelType, stateKey: "", content: threadTag},
+			{roomID: uncachedRoom, type: threadParentType, stateKey: "", content: threadContent},
+			{roomID: uncachedRoom, type: channelType, stateKey: "", content: {type: "public_thread", name: "uncached"}},
+			{roomID: nickRoom, type: channelType, stateKey: "", content: {type: "text", name: "Custom nick"}}
+		]))
 	} finally {
 		api.getStateEvent = realGetStateEvent
 		api.sendState = realSendState
@@ -589,7 +654,7 @@ test("_syncSpaceMember: thread child of the space has the thread parent without 
 			roomID: spaceID,
 			type: "m.space.child",
 			stateKey: threadRoom,
-			content: {via: ["cadence.moe"], [threadParentType]: {room_id: seedParentRoom}}
+			content: {via: ["cadence.moe"], [threadParentType]: {room_id: seedParentRoom}, [channelType]: {type: "public_thread", name: "Hey."}}
 		}])
 	} finally {
 		api.getAllState = realGetAllState
@@ -634,7 +699,7 @@ test("syncSpaceOrder: thread children get the thread parent, non-threads and up-
 			[guildSpaceID]: [
 				{type: "m.space.child", state_key: roomA, content: {via: ["cadence.moe"]}}, // no order yet
 				{type: "m.space.child", state_key: roomT1, content: {via: ["cadence.moe"]}}, // thread, no order or thread parent yet
-				{type: "m.space.child", state_key: roomT2, content: {via: ["cadence.moe"], order: orderT2, [threadParentType]: {room_id: roomA}}} // already correct
+				{type: "m.space.child", state_key: roomT2, content: {via: ["cadence.moe"], order: orderT2, [threadParentType]: {room_id: roomA}, [channelType]: {type: "public_thread", name: "t2"}}} // already correct
 			],
 			// The forum's room is the space for its posts
 			[roomForum]: [
@@ -652,9 +717,9 @@ test("syncSpaceOrder: thread children get the thread parent, non-threads and up-
 		await syncSpaceOrder(guildID)
 
 		t.deepEqual(sortSent(sent), sortSent([
-			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomA, content: {via: ["cadence.moe"], order: orderA, [categoryType]: {id: category.id, name: category.name}}},
-			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomT1, content: {via: ["cadence.moe"], order: orderT1, [threadParentType]: {room_id: roomA}}},
-			{roomID: roomForum, type: "m.space.child", stateKey: roomPost, content: {via: ["cadence.moe"], [threadParentType]: {room_id: roomForum}}}
+			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomA, content: {via: ["cadence.moe"], order: orderA, [categoryType]: {id: category.id, name: category.name}, [channelType]: {type: "text", name: "a"}}},
+			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomT1, content: {via: ["cadence.moe"], order: orderT1, [threadParentType]: {room_id: roomA}, [channelType]: {type: "public_thread", name: "t1"}}},
+			{roomID: roomForum, type: "m.space.child", stateKey: roomPost, content: {via: ["cadence.moe"], [threadParentType]: {room_id: roomForum}, [channelType]: {type: "public_thread", name: "post"}}}
 		]))
 	} finally {
 		api.getAllState = realGetAllState
@@ -698,7 +763,8 @@ test("_syncSpaceMember: channel in a category has the category", async t => {
 			content: {
 				via: ["cadence.moe"],
 				order: "0004" + "0" + "0001" + "00700000000000000072",
-				[categoryType]: {id: category.id, name: "Category"}
+				[categoryType]: {id: category.id, name: "Category"},
+				[channelType]: {type: "text", name: "child"}
 			}
 		}])
 	} finally {
@@ -748,9 +814,9 @@ test("syncSpaceOrder: category key follows the category name, is removed when a 
 				// moved out of the category, so the key has to go
 				{type: "m.space.child", state_key: roomUncategorised, content: {via: ["cadence.moe"], order: orderUncategorised, [categoryType]: categoryContent}},
 				// already correct
-				{type: "m.space.child", state_key: roomCorrect, content: {via: ["cadence.moe"], order: orderCorrect, [categoryType]: categoryContent}},
+				{type: "m.space.child", state_key: roomCorrect, content: {via: ["cadence.moe"], order: orderCorrect, [categoryType]: categoryContent, [channelType]: {type: "text", name: "correct"}}},
 				// threads never get the category
-				{type: "m.space.child", state_key: roomThread, content: {via: ["cadence.moe"], order: orderThread, [threadParentType]: {room_id: roomCorrect}}}
+				{type: "m.space.child", state_key: roomThread, content: {via: ["cadence.moe"], order: orderThread, [threadParentType]: {room_id: roomCorrect}, [channelType]: {type: "public_thread", name: "thread"}}}
 			]
 		}
 		// @ts-ignore
@@ -764,8 +830,8 @@ test("syncSpaceOrder: category key follows the category name, is removed when a 
 		await syncSpaceOrder(guildID)
 
 		t.deepEqual(sortSent(sent), sortSent([
-			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomOutdated, content: {via: ["cadence.moe"], order: orderOutdated, [categoryType]: categoryContent}},
-			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomUncategorised, content: {via: ["cadence.moe"], order: orderUncategorised}}
+			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomOutdated, content: {via: ["cadence.moe"], order: orderOutdated, [categoryType]: categoryContent, [channelType]: {type: "text", name: "outdated"}}},
+			{roomID: guildSpaceID, type: "m.space.child", stateKey: roomUncategorised, content: {via: ["cadence.moe"], order: orderUncategorised, [channelType]: {type: "text", name: "uncategorised"}}}
 		]))
 	} finally {
 		api.getAllState = realGetAllState

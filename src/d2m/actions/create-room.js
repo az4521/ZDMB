@@ -51,6 +51,22 @@ const THREAD_PARENT_STATE_TYPE = "moe.crafty.zdmb.thread_parent"
 /** Custom key on the m.space.child event that tells the Zam client which Discord category a channel is in. */
 const CATEGORY_STATE_TYPE = "moe.crafty.zdmb.category"
 
+/** Custom state type that tells the Zam client what kind of Discord channel a room is. Used on the room and on its m.space.child event. */
+const CHANNEL_STATE_TYPE = "moe.crafty.zdmb.channel"
+
+/** @type {Record<number, string>} The `type` of the channel state, for each Discord channel type that has one. */
+const CHANNEL_STATE_TYPES = {
+	[DiscordTypes.ChannelType.GuildText]: "text",
+	[DiscordTypes.ChannelType.GuildVoice]: "voice",
+	[DiscordTypes.ChannelType.GuildStageVoice]: "stage",
+	[DiscordTypes.ChannelType.GuildAnnouncement]: "announcement",
+	[DiscordTypes.ChannelType.GuildForum]: "forum",
+	[DiscordTypes.ChannelType.GuildMedia]: "media",
+	[DiscordTypes.ChannelType.PublicThread]: "public_thread",
+	[DiscordTypes.ChannelType.PrivateThread]: "private_thread",
+	[DiscordTypes.ChannelType.AnnouncementThread]: "announcement_thread"
+}
+
 /** @type {Map<string, Promise<string>>} channel ID -> Promise<room ID> */
 const inflightRoomCreate = sync.remember(() => new Map())
 
@@ -80,6 +96,18 @@ function convertNameAndTopic(channel, guild, customName) {
 		 : `${maybeTopicWithNewlines}${channelIDPart}\n${guildIDPart}`;
 
 	return [chosenName, convertedTopic];
+}
+
+/**
+ * Builds the `moe.crafty.zdmb.channel` content: the Discord channel type, and the room name without the prefix that convertNameAndTopic adds.
+ * @param {{type: number, name: string}} channel
+ * @param {string | null | undefined} customName the room's nick, if it has one
+ * @returns {{type: string, name: string} | null} null if the channel type has no tag
+ */
+function channelToChannelTag(channel, customName) {
+	const type = CHANNEL_STATE_TYPES[channel.type]
+	if (!type) return null
+	return {type, name: customName || channel.name}
 }
 
 /**
@@ -237,6 +265,10 @@ async function channelToKState(channel, guild, di) {
 	// Tell the Zam client which room a thread belongs to
 	const threadParent = threadParentContent(channel)
 	if (threadParent) channelKState[`${THREAD_PARENT_STATE_TYPE}/`] = threadParent
+
+	// Tell the Zam client what kind of channel this is
+	const channelTag = channelToChannelTag(channel, customName)
+	if (channelTag) channelKState[`${CHANNEL_STATE_TYPE}/`] = channelTag
 
 	// Make voice channels be a Matrix voice room (MSC3417)
 	if (channel.type === DiscordTypes.ChannelType.GuildVoice) {
@@ -660,7 +692,7 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 	}
 
 	const spaceKState = await ks.roomToKState(spaceID)
-	/** @type {{via?: string[], order?: string, "moe.crafty.zdmb.thread_parent"?: {room_id: string, event_id?: string}, "moe.crafty.zdmb.category"?: {id: string, name: string}}} */
+	/** @type {{via?: string[], order?: string, "moe.crafty.zdmb.thread_parent"?: {room_id: string, event_id?: string}, "moe.crafty.zdmb.category"?: {id: string, name: string}, "moe.crafty.zdmb.channel"?: {type: string, name: string}}} */
 	let spaceEventContent = {}
 	if (
 		channel.type !== DiscordTypes.ChannelType.PrivateThread // private threads do not belong in the space (don't offer people something they can't join)
@@ -678,6 +710,9 @@ async function _syncSpaceMember(channel, spaceID, roomID, guild_id) {
 		if (threadParent) spaceEventContent[THREAD_PARENT_STATE_TYPE] = threadParent
 		const category = channelToCategoryContent(channel)
 		if (category) spaceEventContent[CATEGORY_STATE_TYPE] = category
+		const customName = select("channel_room", "nick", {channel_id: channel.id}).pluck().get()
+		const channelTag = channelToChannelTag(channel, customName)
+		if (channelTag) spaceEventContent[CHANNEL_STATE_TYPE] = channelTag
 	}
 	const spaceDiff = ks.diffKState(spaceKState, {
 		[`m.space.child/${roomID}`]: spaceEventContent
@@ -700,9 +735,9 @@ async function syncSpaceOrder(guildID) {
 	if (!guildSpaceID) return
 
 	// Group the bridged children by the space they are in. Threads of forum/media channels are in the forum's room, which is a space.
-	/** @type {Map<string, {channel: any, roomID: string}[]>} */
+	/** @type {Map<string, {channel: any, roomID: string, nick: string | null}[]>} */
 	const childrenBySpace = new Map()
-	const rows = select("channel_room", ["channel_id", "room_id"], {guild_id: guildID}).all()
+	const rows = select("channel_room", ["channel_id", "room_id", "nick"], {guild_id: guildID}).all()
 	for (const row of rows) {
 		// @ts-ignore
 		const channel = discord.channels.get(row.channel_id)
@@ -718,13 +753,13 @@ async function syncSpaceOrder(guildID) {
 			}
 		}
 		if (!childrenBySpace.has(spaceID)) childrenBySpace.set(spaceID, [])
-		childrenBySpace.get(spaceID).push({channel, roomID: row.room_id})
+		childrenBySpace.get(spaceID).push({channel, roomID: row.room_id, nick: row.nick})
 	}
 
 	for (const [spaceID, children] of childrenBySpace) {
 		const spaceKState = await ks.roomToKState(spaceID)
 		const target = {}
-		for (const {channel, roomID} of children) {
+		for (const {channel, roomID, nick} of children) {
 			const key = `m.space.child/${roomID}`
 			const existing = spaceKState[key]
 			if (!existing?.via) continue // not in this space, or removed from it
@@ -736,6 +771,9 @@ async function syncSpaceOrder(guildID) {
 			const category = channelToCategoryContent(channel)
 			if (category) content[CATEGORY_STATE_TYPE] = category
 			else delete content[CATEGORY_STATE_TYPE] // moved out of a category, or its category is gone
+			const channelTag = channelToChannelTag(channel, nick)
+			if (channelTag) content[CHANNEL_STATE_TYPE] = channelTag
+			else delete content[CHANNEL_STATE_TYPE] // not a channel type that has a tag
 			if (isDeepStrictEqual(content, existing)) continue
 			target[key] = content
 		}
@@ -746,38 +784,46 @@ async function syncSpaceOrder(guildID) {
 }
 
 /**
- * Backfill the `moe.crafty.zdmb.thread_parent` state on the bridged thread rooms of a guild, for threads bridged before this state existed.
- * Only sends the state when it is missing or different. Each room is handled separately, so one failure doesn't stop the rest.
+ * Backfill the in-room state of the bridged rooms of a guild, for rooms bridged before it existed: the `moe.crafty.zdmb.thread_parent` state of thread rooms,
+ * and the `moe.crafty.zdmb.channel` state of every channel that has a tag. Only the events that the room needs are read, one at a time, and only the ones that are missing or different are sent.
+ * Each room is handled separately, so one failure doesn't stop the rest.
  * Used at startup.
  * @param {string} guildID
  */
-async function syncThreadParents(guildID) {
-	const rows = select("channel_room", ["channel_id", "room_id", "thread_parent"], {guild_id: guildID}).all()
+async function syncRoomMarkers(guildID) {
+	const rows = select("channel_room", ["channel_id", "room_id", "name", "nick", "thread_parent"], {guild_id: guildID}).all()
 	for (const row of rows) {
 		try {
 			// @ts-ignore
 			const cached = discord.channels.get(row.channel_id)
-			/** @type {{id: string, type: number, parent_id?: string | null} | undefined} */
+			/** @type {{id: string, type: number, name: string, parent_id?: string | null} | undefined} */
 			let channel = cached
 			// Archived threads may not be cached. Only public threads store thread_parent, so that's the type to assume for them.
 			if (!cached && row.thread_parent) {
-				channel = {id: row.channel_id, type: DiscordTypes.ChannelType.PublicThread, parent_id: row.thread_parent}
+				channel = {id: row.channel_id, type: DiscordTypes.ChannelType.PublicThread, name: row.name, parent_id: row.thread_parent}
 			}
 			if (!channel) continue
 
-			const content = threadParentContent(channel)
-			if (!content) continue
+			/** @type {Record<string, any>} */
+			const expected = {}
+			const threadParent = threadParentContent(channel)
+			if (threadParent) expected[THREAD_PARENT_STATE_TYPE] = threadParent
+			const channelTag = channelToChannelTag(channel, row.nick)
+			if (channelTag) expected[CHANNEL_STATE_TYPE] = channelTag
+			if (!Object.keys(expected).length) continue
 
-			/** @type {any} */
-			let current = null
-			try {
-				current = await api.getStateEvent(row.room_id, THREAD_PARENT_STATE_TYPE, "")
-			} catch (e) {} // doesn't exist yet
-			if (isDeepStrictEqual(current, content)) continue
-
-			await api.sendState(row.room_id, THREAD_PARENT_STATE_TYPE, "", content)
+			for (const [type, content] of Object.entries(expected)) {
+				// A targeted read, rather than the whole room state (which includes every member event)
+				/** @type {any} */
+				let current = null
+				try {
+					current = await api.getStateEvent(row.room_id, type, "")
+				} catch (e) {} // doesn't exist yet
+				if (isDeepStrictEqual(current, content)) continue
+				await api.sendState(row.room_id, type, "", content)
+			}
 		} catch (e) {
-			console.error(`[thread parent sync] failed for room ${row.room_id}:`, e)
+			console.error(`[room marker sync] failed for room ${row.room_id}:`, e)
 		}
 	}
 }
@@ -824,6 +870,7 @@ module.exports.syncCategoryChildrenOrder = syncCategoryChildrenOrder
 module.exports.syncSpaceOrder = syncSpaceOrder
 module.exports.threadParentContent = threadParentContent
 module.exports.threadParentSpaceContent = threadParentSpaceContent
-module.exports.syncThreadParents = syncThreadParents
+module.exports.syncRoomMarkers = syncRoomMarkers
+module.exports.channelToChannelTag = channelToChannelTag
 module.exports.existsOrAutocreatable = existsOrAutocreatable
 module.exports.assertExistsOrAutocreatable = assertExistsOrAutocreatable

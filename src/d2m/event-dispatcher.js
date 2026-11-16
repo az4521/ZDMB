@@ -178,11 +178,11 @@ module.exports = {
 	},
 
 	/**
-	 * When logging back in, make sure every bridged thread room has the thread parent state, including threads bridged before it existed.
+	 * When logging back in, make sure every bridged room has the state markers (thread parent, channel type), including rooms bridged before they existed.
 	 * @param {DiscordTypes.GatewayGuildCreateDispatchData} guild
 	 */
-	async checkThreadParents(guild) {
-		await createRoom.syncThreadParents(guild.id)
+	async checkRoomMarkers(guild) {
+		await createRoom.syncRoomMarkers(guild.id)
 	},
 
 	/**
