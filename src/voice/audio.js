@@ -1,6 +1,6 @@
 // @ts-check
 // Pure audio helpers for the voice bridge. No native modules are loaded at
-// require time; opusscript is only required inside createOpusDecoder().
+// require time; opusscript is only required inside createOpusDecoder() and createOpusEncoder().
 
 const {Readable} = require("stream")
 
@@ -28,6 +28,30 @@ const createOpusDecoder = () => {
 		/** @param {Buffer} opusPacket */
 		decode(opusPacket) {
 			return decoder.decode(opusPacket)
+		},
+	}
+}
+
+/**
+ * @typedef {Object} OpusEncoder
+ * @property {(pcm: Buffer) => Buffer} encode one 20 ms stereo frame (3840 bytes) to one Opus packet
+ * @property {() => void} delete frees the native encoder. Call once, after the last encode().
+ */
+
+/**
+ * Creates a stateful Opus encoder for 48 kHz stereo music-quality audio. Each encode() takes one 20 ms frame.
+ * @returns {OpusEncoder}
+ */
+const createOpusEncoder = () => {
+	const OpusScript = require("opusscript")
+	const encoder = new OpusScript(SAMPLE_RATE, 2, OpusScript.Application.AUDIO)
+	return {
+		/** @param {Buffer} pcm */
+		encode(pcm) {
+			return encoder.encode(pcm, MONO_FRAME_SAMPLES)
+		},
+		delete() {
+			encoder.delete()
 		},
 	}
 }
@@ -86,30 +110,45 @@ const mixMono = (frames, length) => {
  * Bounded ring buffer of mono Int16 samples at 48 kHz, used to smooth out
  * network jitter between a Matrix participant's audio and the bridge output.
  *
- * - push() drops the oldest samples once more than `maxMs` are buffered.
- * - Priming: after construction and after every underrun the buffer does not
- *   emit audio until `primeMs` have accumulated; read() returns silence in the
- *   meantime without consuming samples. This trades ~one prime of latency for
- *   not stuttering on every packet gap.
- * - read(n) always returns exactly n samples, zero-filled on underrun.
+ * - Priming: the buffer does not emit audio until `primeMs` have accumulated, once at the start of a talk spurt.
+ *   Until then read() returns silence without consuming samples.
+ * - Brief gaps: once primed, a read that finds fewer samples than asked for returns what is there, zero-filled after
+ *   that, and stays primed. Frames arrive unevenly, so this is the normal case and must not stutter.
+ * - Re-priming: after `reprimeAfterMs` of consecutive reads that found the buffer empty, the speaker has stopped. The
+ *   buffer goes back to the unprimed state and waits for `primeMs` again.
+ * - Hard cap: push() drops the oldest samples once more than `maxMs` are buffered.
+ * - Soft cap: when a read finds more than `targetMaxMs` buffered (clock drift built up delay), the oldest samples are
+ *   dropped down to `primeMs` before the read, so delay can't accumulate.
+ * - read(n) always returns exactly n samples, zero-filled where the buffer ran dry.
+ * - stats() counts underrun reads and dropped samples since the last reset().
  */
 class JitterBuffer {
 	/** @type {number} */
 	#capacity
 	/** @type {number} */
 	#primeSamples
+	/** @type {number} */
+	#targetSamples
+	/** @type {number} */
+	#reprimeSamples
 	/** @type {Int16Array} */
 	#buf
 	#head = 0
 	#length = 0
 	#primed = false
+	/** Samples in a row, from reads that found the buffer empty */
+	#starvedSamples = 0
+	#underrunReads = 0
+	#droppedSamples = 0
 
 	/**
-	 * @param {{maxMs?: number, primeMs?: number}} [options]
+	 * @param {{maxMs?: number, primeMs?: number, targetMaxMs?: number, reprimeAfterMs?: number}} [options]
 	 */
-	constructor({maxMs = 200, primeMs = 40} = {}) {
+	constructor({maxMs = 200, primeMs = 40, targetMaxMs = 100, reprimeAfterMs = 200} = {}) {
 		this.#capacity = msToSamples(maxMs)
 		this.#primeSamples = msToSamples(primeMs)
+		this.#targetSamples = msToSamples(targetMaxMs)
+		this.#reprimeSamples = msToSamples(reprimeAfterMs)
 		this.#buf = new Int16Array(this.#capacity)
 	}
 
@@ -124,12 +163,14 @@ class JitterBuffer {
 	push(samples) {
 		let input = samples
 		if (input.length > this.#capacity) {
+			this.#droppedSamples += input.length - this.#capacity
 			input = input.subarray(input.length - this.#capacity)
 		}
 		const overflow = this.#length + input.length - this.#capacity
 		if (overflow > 0) {
 			this.#head = (this.#head + overflow) % this.#capacity
 			this.#length -= overflow
+			this.#droppedSamples += overflow
 		}
 		for (let i = 0; i < input.length; i++) {
 			this.#buf[(this.#head + this.#length + i) % this.#capacity] = input[i]
@@ -147,48 +188,79 @@ class JitterBuffer {
 			if (this.#length < this.#primeSamples) return out
 			this.#primed = true
 		}
+		if (this.#length > this.#targetSamples) {
+			const excess = this.#length - this.#primeSamples
+			this.#head = (this.#head + excess) % this.#capacity
+			this.#length = this.#primeSamples
+			this.#droppedSamples += excess
+		}
 		const take = Math.min(n, this.#length)
 		for (let i = 0; i < take; i++) {
 			out[i] = this.#buf[(this.#head + i) % this.#capacity]
 		}
 		this.#head = (this.#head + take) % this.#capacity
 		this.#length -= take
-		if (take < n) this.#primed = false // underrun: re-prime before emitting again
+
+		if (take < n) this.#underrunReads++
+		if (take === 0) {
+			this.#starvedSamples += n
+			if (this.#starvedSamples >= this.#reprimeSamples) {
+				this.#primed = false // the speaker has stopped: wait for a full prime before playing again
+				this.#starvedSamples = 0
+			}
+		} else {
+			this.#starvedSamples = 0
+		}
 		return out
+	}
+
+	/**
+	 * @returns {{underrunReads: number, droppedSamples: number}} counts since the last reset()
+	 */
+	stats() {
+		return {underrunReads: this.#underrunReads, droppedSamples: this.#droppedSamples}
+	}
+
+	reset() {
+		this.#underrunReads = 0
+		this.#droppedSamples = 0
 	}
 }
 
 /**
- * Readable (non-object mode) that produces one 3840-byte stereo s16le frame per read, pulled from a callback.
- * Designed for @discordjs/voice's StreamType.Raw.
+ * Readable in object mode that produces one Opus packet per read. Each packet is one 20 ms frame pulled from a
+ * callback and encoded here. Designed for @discordjs/voice's StreamType.Opus, which plays the packets as they are, with
+ * no encoder in between that would hold frames back.
  *
- * Production is demand-driven and has no timer. The voice library pipes this stream into an Opus encoder, and the
- * player reads one packet every 20 ms from that encoder, so backpressure makes this stream produce exactly as fast as
- * the player consumes. A timer tied to wall-clock time would underrun on ordinary jitter, and the player goes Idle
- * for good after a few missed frames.
+ * Production is demand-driven and has no timer. The player reads one packet every 20 ms, so backpressure makes this
+ * stream produce exactly as fast as the player consumes. A timer tied to wall-clock time would underrun on ordinary jitter,
+ * and the player goes Idle for good after a few missed frames.
  *
- * - _read() pushes frames synchronously until push() returns false, so at most highWaterMark bytes are ever produced ahead.
- * - If pull() returns null, a frame of silence is emitted.
- * - If pull() throws, the stream is destroyed with that error.
- * - stop() ends the stream (push(null)) and stops producing.
+ * - highWaterMark is 2 packets, so at most two packets (40 ms) are ever produced ahead of the player.
+ * - _read() pushes packets synchronously until push() returns false.
+ * - If pull() returns null, a frame of silence is encoded and sent.
+ * - If pull() or the encoder throws, the stream is destroyed with that error.
+ * - stop() ends the stream (push(null)) and stops producing. Destroying the stream frees the encoder.
  */
-class LivePcmStream extends Readable {
+class LiveOpusStream extends Readable {
 	/** @type {() => Buffer | null} */
 	#pull
+	/** @type {OpusEncoder} */
+	#encoder
 	#stopped = false
 
 	/**
 	 * @param {() => Buffer | null} pull returns the next 3840-byte stereo frame, or null for silence. Must not block.
 	 */
 	constructor(pull) {
-		// Keep only a few frames buffered ahead of the consumer.
-		super({highWaterMark: STEREO_FRAME_BYTES * 4})
+		super({objectMode: true, highWaterMark: 2})
 		this.#pull = pull
+		this.#encoder = createOpusEncoder()
 	}
 
 	_read() {
 		try {
-			while (!this.#stopped && this.push(this.#nextFrame())) {
+			while (!this.#stopped && this.push(this.#nextPacket())) {
 				// Keep producing until the buffer is at its high-water mark
 			}
 		} catch (err) {
@@ -200,11 +272,16 @@ class LivePcmStream extends Readable {
 	/** @param {Error | null} err @param {(err?: Error | null) => void} callback */
 	_destroy(err, callback) {
 		this.#stopped = true
+		try {
+			this.#encoder.delete()
+		} catch (e) {
+			// Already freed, or never fully created: nothing else to release
+		}
 		callback(err)
 	}
 
 	/**
-	 * Ends the stream. Frames already buffered are still delivered, then EOF.
+	 * Ends the stream. Packets already buffered are still delivered, then EOF.
 	 */
 	stop() {
 		if (this.#stopped) return
@@ -213,11 +290,11 @@ class LivePcmStream extends Readable {
 	}
 
 	/** @returns {Buffer} */
-	#nextFrame() {
+	#nextPacket() {
 		const data = this.#pull()
 		const frame = Buffer.alloc(STEREO_FRAME_BYTES)
 		if (data) data.copy(frame, 0, 0, Math.min(data.length, STEREO_FRAME_BYTES))
-		return frame
+		return this.#encoder.encode(frame)
 	}
 }
 
@@ -226,9 +303,10 @@ module.exports = {
 	SAMPLE_RATE,
 	STEREO_FRAME_BYTES,
 	createOpusDecoder,
+	createOpusEncoder,
 	stereoToMono,
 	monoToStereo,
 	mixMono,
 	JitterBuffer,
-	LivePcmStream,
+	LiveOpusStream,
 }

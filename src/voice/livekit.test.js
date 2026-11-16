@@ -74,10 +74,11 @@ function makeFakeRtc() {
 	}
 
 	class FakeAudioSource {
-		/** @param {number} sampleRate @param {number} numChannels */
-		constructor(sampleRate, numChannels) {
+		/** @param {number} sampleRate @param {number} numChannels @param {number} [queueSize] */
+		constructor(sampleRate, numChannels, queueSize) {
 			this.sampleRate = sampleRate
 			this.numChannels = numChannels
+			this.queueSize = queueSize
 			/** @type {FakeAudioFrame[]} */
 			this.captured = []
 			this.closed = false
@@ -250,11 +251,12 @@ test("Publisher: splits each 20 ms push into two 10 ms frames in order", async t
 })
 
 test("Publisher: connect uses no autoSubscribe, publishes a microphone track", async t => {
-	const {rtc, rooms} = makeFakeRtc()
+	const {rtc, rooms, sources} = makeFakeRtc()
 	const publisher = new Publisher({url: "wss://lk.example", jwt: "jwt"}, {rtc})
 	await publisher.connect()
 	const room = rooms[0]
 	t.deepEqual(room.connectArgs, {url: "wss://lk.example", token: "jwt", options: {autoSubscribe: false, dynacast: false}})
+	t.equal(sources[0].queueSize, 100, "AudioSource queues at most 100 ms, not the 1000 ms default")
 	t.equal(room.published.length, 1)
 	t.equal(room.published[0].track.name, "discord-audio")
 	t.equal(room.published[0].opts.source, TrackSource.SOURCE_MICROPHONE)
@@ -276,28 +278,28 @@ test("Publisher: pushes before connect and after close are ignored", async t => 
 	t.end()
 })
 
-test("Publisher: drops frames instead of queuing more than ~200 ms behind", async t => {
+test("Publisher: drops frames instead of queuing more than ~100 ms behind", async t => {
 	const {rtc, sources} = makeFakeRtc()
 	const publisher = new Publisher({url: "wss://lk.example", jwt: "jwt"}, {rtc})
 	await publisher.connect()
 	const source = sources[0]
 	source.blocking = true
 	for (let i = 0; i < 50; i++) publisher.pushMono(ramp(960, i))
-	// 200 ms = 20 frames of 10 ms, and every push adds two frames
-	t.equal(publisher.pending, 20)
+	// 100 ms = 10 frames of 10 ms, and every push adds two frames
+	t.equal(publisher.pending, 10)
 	source.release()
 	await publisher.drain()
-	t.equal(source.captured.length, 20)
+	t.equal(source.captured.length, 10)
 	await publisher.close()
 	t.end()
 })
 
-test("Publisher: drops a push when the source reports more than 200 ms queued", async t => {
+test("Publisher: drops a push when the source reports more than 100 ms queued", async t => {
 	const {rtc, sources} = makeFakeRtc()
 	const publisher = new Publisher({url: "wss://lk.example", jwt: "jwt"}, {rtc})
 	await publisher.connect()
 	const source = sources[0]
-	source.queuedDuration = 250
+	source.queuedDuration = 150
 	publisher.pushMono(ramp(960))
 	await publisher.drain()
 	t.equal(source.captured.length, 0)

@@ -3,12 +3,31 @@ const {test} = require("supertape")
 const {
 	STEREO_FRAME_BYTES,
 	createOpusDecoder,
+	createOpusEncoder,
 	stereoToMono,
 	monoToStereo,
 	mixMono,
 	JitterBuffer,
-	LivePcmStream,
+	LiveOpusStream,
 } = require("./audio")
+
+/** @param {number} ms */
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/**
+ * One 20 ms stereo s16le frame holding a sine tone.
+ * @param {number} [freq]
+ * @returns {Buffer}
+ */
+function toneFrame(freq = 440) {
+	const pcm = Buffer.alloc(STEREO_FRAME_BYTES)
+	for (let i = 0; i < 960; i++) {
+		const sample = Math.round(8000 * Math.sin(2 * Math.PI * freq * i / 48000))
+		pcm.writeInt16LE(sample, i * 4)
+		pcm.writeInt16LE(sample, i * 4 + 2)
+	}
+	return pcm
+}
 
 test("audio: stereo -> mono -> stereo round-trips identical mono samples", t => {
 	const mono = Int16Array.from([0, 1000, -1000, 32767, -32768])
@@ -73,23 +92,62 @@ test("audio: JitterBuffer primes before emitting, then emits exact-length reads"
 	t.equal(jb.bufferedMs, 20)
 })
 
-test("audio: JitterBuffer zero-fills on underrun and re-primes", t => {
+test("audio: JitterBuffer primes once per talk spurt, so a brief gap does not re-prime", t => {
 	const jb = new JitterBuffer()
 	jb.push(new Int16Array(1920).fill(3))
 	t.ok(jb.read(960).every(s => s === 3))
-	// Only 960 left, asking for 1920: 960 real samples then zeros.
-	const partial = jb.read(1920)
-	t.equal(partial.length, 1920)
-	t.ok(partial.subarray(0, 960).every(s => s === 3))
-	t.ok(partial.subarray(960).every(s => s === 0))
-	t.equal(jb.bufferedMs, 0)
-	// Re-primed after the underrun: next read is silence until 40 ms again.
-	jb.push(new Int16Array(960).fill(9))
+	t.ok(jb.read(960).every(s => s === 3))
+	// Empty now: the read is zero-filled, but the buffer stays primed
 	t.ok(jb.read(960).every(s => s === 0))
+	// A single frame arrives and plays straight away, with no 40 ms wait
+	jb.push(new Int16Array(960).fill(9))
+	t.ok(jb.read(960).every(s => s === 9), "playing resumes at once after a brief gap")
+	t.equal(jb.stats().underrunReads, 1, "the gap is counted as one underrun read")
 })
 
-test("audio: JitterBuffer drops oldest samples beyond 200 ms", t => {
-	const jb = new JitterBuffer({primeMs: 0})
+test("audio: JitterBuffer re-primes only after reprimeAfterMs of reads that found it empty", t => {
+	const jb = new JitterBuffer()
+	jb.push(new Int16Array(1920).fill(3))
+	jb.read(960)
+	jb.read(960)
+	// Nine empty reads are 180 ms: still primed, so a frame plays at once
+	for (let i = 0; i < 9; i++) jb.read(960)
+	jb.push(new Int16Array(960).fill(9))
+	t.ok(jb.read(960).every(s => s === 9), "still primed after 180 ms of silence")
+
+	// Ten empty reads (200 ms) mean the speaker stopped. Now one frame is not enough to play.
+	for (let i = 0; i < 10; i++) jb.read(960)
+	jb.push(new Int16Array(960).fill(9))
+	t.ok(jb.read(960).every(s => s === 0), "silent again until the prime is back")
+	t.equal(jb.bufferedMs, 20, "nothing is consumed while unprimed")
+	jb.push(new Int16Array(960).fill(9))
+	t.ok(jb.read(960).every(s => s === 9), "plays once 40 ms are buffered again")
+})
+
+test("audio: JitterBuffer soft cap drops oldest samples down to primeMs when over targetMaxMs", t => {
+	const jb = new JitterBuffer()
+	const total = 9600 // 200 ms
+	const ramp = new Int16Array(total)
+	for (let i = 0; i < total; i++) ramp[i] = i
+	jb.push(ramp)
+	t.equal(jb.bufferedMs, 200)
+	const out = jb.read(960)
+	// 9600 buffered is over the 100 ms target: 7680 oldest are dropped, leaving 40 ms, then 20 ms is read
+	t.equal(out[0], 7680)
+	t.equal(out[959], 7680 + 959)
+	t.equal(jb.bufferedMs, 20)
+	t.equal(jb.stats().droppedSamples, 7680)
+})
+
+test("audio: JitterBuffer does not soft-drop at exactly targetMaxMs", t => {
+	const jb = new JitterBuffer()
+	jb.push(new Int16Array(4800).fill(5)) // 100 ms
+	t.ok(jb.read(960).every(s => s === 5))
+	t.equal(jb.stats().droppedSamples, 0)
+})
+
+test("audio: JitterBuffer hard cap drops oldest samples beyond maxMs", t => {
+	const jb = new JitterBuffer({primeMs: 0, targetMaxMs: 200})
 	const total = 14400 // 300 ms
 	const ramp = new Int16Array(total)
 	for (let i = 0; i < total; i++) ramp[i] = i
@@ -98,18 +156,25 @@ test("audio: JitterBuffer drops oldest samples beyond 200 ms", t => {
 	const out = jb.read(960)
 	t.equal(out[0], total - 9600)
 	t.equal(out[959], total - 9600 + 959)
+	t.equal(jb.stats().droppedSamples, 4800)
+})
+
+test("audio: JitterBuffer stats() and reset()", t => {
+	const jb = new JitterBuffer()
+	jb.read(960) // unprimed silence is not an underrun
+	jb.push(new Int16Array(1920).fill(1))
+	jb.read(960)
+	jb.read(960)
+	jb.read(960) // empty: underrun
+	t.deepEqual(jb.stats(), {underrunReads: 1, droppedSamples: 0})
+	jb.reset()
+	t.deepEqual(jb.stats(), {underrunReads: 0, droppedSamples: 0})
 })
 
 test("audio: createOpusDecoder decodes an Opus packet produced by OpusScript's encoder", t => {
 	const OpusScript = require("opusscript")
 	const encoder = new OpusScript(48000, 2, OpusScript.Application.VOIP)
-	const pcm = Buffer.alloc(STEREO_FRAME_BYTES)
-	for (let i = 0; i < 960; i++) {
-		const sample = Math.round(8000 * Math.sin(2 * Math.PI * 440 * i / 48000))
-		pcm.writeInt16LE(sample, i * 4)
-		pcm.writeInt16LE(sample, i * 4 + 2)
-	}
-	const packet = encoder.encode(pcm, 960)
+	const packet = encoder.encode(toneFrame(), 960)
 	encoder.delete()
 
 	const decoder = createOpusDecoder()
@@ -118,75 +183,68 @@ test("audio: createOpusDecoder decodes an Opus packet produced by OpusScript's e
 	t.ok(decoded.some(b => b !== 0), "decoded audio is not silence")
 })
 
-test("audio: LivePcmStream emits 3840-byte frames on every read", async t => {
-	let n = 0
-	const stream = new LivePcmStream(() => (n++ < 2 ? Buffer.alloc(STEREO_FRAME_BYTES, 1) : null))
+test("audio: createOpusEncoder round-trips a frame through createOpusDecoder", t => {
+	const encoder = createOpusEncoder()
+	const packet = encoder.encode(toneFrame())
+	encoder.delete()
+	t.ok(Buffer.isBuffer(packet))
+	t.ok(packet.length > 0 && packet.length < STEREO_FRAME_BYTES, "a packet is much smaller than the PCM frame")
+
+	const decoded = createOpusDecoder().decode(packet)
+	t.equal(decoded.length, STEREO_FRAME_BYTES)
+	t.ok(decoded.some(b => b !== 0), "decoded audio is not silence")
+})
+
+test("audio: LiveOpusStream emits one Opus packet per read, with silence for null pulls", async t => {
+	const frames = [toneFrame(), toneFrame(880)]
+	const stream = new LiveOpusStream(() => frames.shift() ?? null)
 	/** @type {Buffer[]} */
-	const chunks = []
+	const packets = []
 	await new Promise((resolve, reject) => {
 		const failsafe = setTimeout(() => {
 			stream.stop()
-			reject(new Error("LivePcmStream produced too few frames"))
+			reject(new Error("LiveOpusStream produced too few packets"))
 		}, 2000)
 		stream.on("error", reject)
-		stream.on("data", chunk => {
-			chunks.push(chunk)
-			if (chunks.length === 6) {
+		stream.on("data", packet => {
+			packets.push(packet)
+			if (packets.length === 4) {
 				clearTimeout(failsafe)
 				stream.stop()
 				resolve(undefined)
 			}
 		})
 	})
-	t.ok(chunks.every(c => c.length === STEREO_FRAME_BYTES), "every frame is 3840 bytes")
-	t.ok(chunks.slice(2).every(c => c.every(b => b === 0)), "null pulls yield silence")
+	t.ok(packets.every(p => Buffer.isBuffer(p) && p.length > 0), "every read is one non-empty Buffer packet")
+	const decoder = createOpusDecoder()
+	t.equal(decoder.decode(packets[0]).length, STEREO_FRAME_BYTES)
+	t.ok(decoder.decode(packets[0]).some(b => b !== 0), "a pulled frame comes out as audio")
+	// Packets already buffered when stop() is called are still delivered, so there can be more than four
+	t.ok(packets.length >= 4, "at least the four packets asked for")
 })
 
-test("audio: LivePcmStream passes pulled frames through in order, with silence for null", async t => {
-	let n = 0
-	const stream = new LivePcmStream(() => (n < 3 ? Buffer.alloc(STEREO_FRAME_BYTES, ++n) : null))
-	/** @type {Buffer[]} */
-	const chunks = []
-	await new Promise((resolve, reject) => {
-		const failsafe = setTimeout(() => {
-			stream.stop()
-			reject(new Error("timeout"))
-		}, 2000)
-		stream.on("error", reject)
-		stream.on("data", chunk => {
-			chunks.push(chunk)
-			if (chunks.length === 4) {
-				clearTimeout(failsafe)
-				stream.stop()
-				resolve(undefined)
-			}
-		})
-	})
-	t.deepEqual(chunks.slice(0, 4).map(c => c[0]), [1, 2, 3, 0])
-})
-
-test("audio: LivePcmStream never produces more than its high-water mark ahead of the reader", async t => {
+test("audio: LiveOpusStream keeps at most two packets ahead of the reader", async t => {
 	let pulls = 0
-	const stream = new LivePcmStream(() => {
+	const stream = new LiveOpusStream(() => {
 		pulls++
-		return Buffer.alloc(STEREO_FRAME_BYTES, 1)
+		return toneFrame()
 	})
-	// Nobody reads yet: production stops once the buffer holds four frames.
+	// Nobody reads yet: production stops once two packets are buffered.
 	stream.read(0)
-	await new Promise(resolve => setTimeout(resolve, 50))
-	t.equal(pulls, 4, "four frames pulled while unread")
-	t.ok(stream.readableLength <= STEREO_FRAME_BYTES * 4, "buffer is at most the high-water mark")
+	await wait(50)
+	t.equal(pulls, 2, "two frames pulled while unread")
 
-	// One read frees one slot, which produces exactly one more frame.
-	const frame = stream.read(STEREO_FRAME_BYTES)
-	t.equal(frame.length, STEREO_FRAME_BYTES)
-	t.equal(pulls, 5, "one more frame pulled after one read")
+	// One read frees one slot, which produces exactly one more packet.
+	const packet = stream.read()
+	t.ok(Buffer.isBuffer(packet), "read() returns one packet")
+	await wait(10)
+	t.equal(pulls, 3, "one more frame pulled after one read")
 	stream.stop()
 })
 
-test("audio: LivePcmStream stop() ends the stream and stops pulling", async t => {
+test("audio: LiveOpusStream stop() ends the stream and stops pulling", async t => {
 	let pulls = 0
-	const stream = new LivePcmStream(() => {
+	const stream = new LiveOpusStream(() => {
 		pulls++
 		return null
 	})
@@ -200,13 +258,13 @@ test("audio: LivePcmStream stop() ends the stream and stops pulling", async t =>
 		stream.on("data", () => stream.stop())
 	})
 	const pullsAtEnd = pulls
-	await new Promise(resolve => setTimeout(resolve, 50))
+	await wait(50)
 	t.ok(stream.destroyed || stream.readableEnded, "stream ended")
 	t.equal(pulls, pullsAtEnd, "no frames are pulled after stop()")
 })
 
-test("audio: LivePcmStream destroys itself with the error when pull() throws", async t => {
-	const stream = new LivePcmStream(() => {
+test("audio: LiveOpusStream destroys itself with the error when pull() throws", async t => {
+	const stream = new LiveOpusStream(() => {
 		throw new Error("boom")
 	})
 	const err = await new Promise((resolve, reject) => {

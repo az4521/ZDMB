@@ -3,6 +3,7 @@
 const {test} = require("supertape")
 const {EventEmitter} = require("events")
 const bridge = require("./bridge")
+const audio = require("./audio")
 
 const GUILD = "800"
 const CHANNEL = "900"
@@ -201,7 +202,7 @@ function makeEnv({voiceBridge = true, puppets = [], callMembers = [], rooms = ne
 	const voiceLib = {
 		EndBehaviorType: {AfterSilence: "AfterSilence"},
 		NoSubscriberBehavior: {Play: "Play"},
-		StreamType: {Raw: "Raw"},
+		StreamType: {Raw: "Raw", Opus: "Opus"},
 		/** @type {any[]} */
 		players: [],
 		createAudioPlayer() {
@@ -492,6 +493,60 @@ test("voice bridge: Matrix tracks get a dedicated puppet when one is free, other
 	}
 })
 
+test("voice bridge: the anchor plays Opus packets with no encoder in between", async t => {
+	const env = makeEnv()
+	try {
+		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(BOB, JOIN_CONTENT))
+		await bridge._idle()
+
+		const resource = env.voiceLib.players[0].resource
+		t.equal(resource.options.inputType, "Opus", "resource is declared as Opus input")
+		t.ok(resource.stream instanceof audio.LiveOpusStream, "the feed is an Opus packet stream")
+		t.end()
+	} finally {
+		await bridge.stop()
+		env.restore()
+	}
+})
+
+test("voice bridge: the summary line counts jitter-buffer underruns and drops, then resets them", async t => {
+	const env = makeEnv()
+	const logged = /** @type {string[]} */ ([])
+	const realLog = console.log
+	console.log = (...args) => { logged.push(args.join(" ")) }
+	try {
+		await bridge.start()
+		bridge.onMatrixCallMemberEvent(callEvent(BOB, JOIN_CONTENT))
+		await bridge._idle()
+		const listener = env.listeners[0]
+		listener.emit("trackStart", `${BOB}:ZDMBVOICE`, BOB)
+		await bridge._idle()
+
+		// Two 20 ms frames prime the buffer, then the third read finds it empty
+		listener.emit("audio", `${BOB}:ZDMBVOICE`, new Int16Array(1920).fill(1000))
+		const cb = bridge._channelBridges.get(CHANNEL_KEY)
+		cb.pullOverflow()
+		cb.pullOverflow()
+		cb.pullOverflow()
+
+		logged.length = 0
+		cb.logStats()
+		const line = logged.find(l => l.includes("matrixAudioFrames="))
+		t.ok(line?.includes("jitterUnderrunReads=1 jitterDroppedSamples=0"), `summary line has the counters: ${line}`)
+
+		logged.length = 0
+		cb.logStats()
+		const next = logged.find(l => l.includes("matrixAudioFrames="))
+		t.ok(next?.includes("jitterUnderrunReads=0 jitterDroppedSamples=0"), "counters reset after each summary line")
+		t.end()
+	} finally {
+		console.log = realLog
+		await bridge.stop()
+		env.restore()
+	}
+})
+
 test("voice bridge: a Discord human leaving closes their publisher and membership, and the call stays up for others", async t => {
 	const env = makeEnv()
 	try {
@@ -763,6 +818,36 @@ test("voice bridge: a Discord soundboard sound from someone without a publisher 
 	}
 })
 
+test("voice bridge: a soundboard effect sent by our own bot is not bridged again, but a human's still is", async t => {
+	const env = makeEnv({puppets: [fakeBot(BOT_PUPPET, false)]})
+	const logged = /** @type {string[]} */ ([])
+	const realLog = console.log
+	console.log = (...args) => { logged.push(args.join(" ")) }
+	try {
+		await bridge.start()
+		bridge.onDiscordVoiceState(voiceState(DISCORD_USER, CHANNEL))
+		await bridge._idle()
+
+		// Discord reports a native sound that our main bot played as an effect from the bot itself
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: BOT_MAIN, sound_id: "111"})
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: BOT_PUPPET, sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.media.uploads.length, 0, "echoes from our bots are not uploaded")
+		t.equal(env.listeners[0].dataPackets.length, 0, "and not sent to Matrix")
+		t.ok(logged.some(l => l.includes(`[soundboard] not bridged: sent by our own bot ${BOT_MAIN}`)), "the skip is logged")
+
+		bridge.onDiscordSoundboard({guild_id: GUILD, channel_id: CHANNEL, user_id: DISCORD_USER, sound_id: "111"})
+		await bridge._idle()
+		t.equal(env.media.uploads.length, 1, "a human's sound is still bridged")
+		t.equal(env.publishers[0].dataPackets.length, 1, "and sent from that human's publisher")
+		t.end()
+	} finally {
+		console.log = realLog
+		await bridge.stop()
+		env.restore()
+	}
+})
+
 test("voice bridge: Discord effects without a sound, and sounds in channels that are not active, are ignored", async t => {
 	const env = makeEnv()
 	try {
@@ -1023,7 +1108,7 @@ test("voice bridge: a player that goes Idle while its channel is active is start
 		await new Promise(resolve => setTimeout(resolve, 1100)) // restarts are spaced at least 1 s apart
 		t.equal(env.voiceLib.players.length, 2, "the player is restarted")
 		const second = env.voiceLib.players[1]
-		t.equal(second.resource.options.inputType, "Raw", "the new player plays a fresh raw stream")
+		t.equal(second.resource.options.inputType, "Opus", "the new player plays a fresh Opus stream")
 
 		await bridge.stop()
 		second.emit("stateChange", {status: "playing"}, {status: "idle"})

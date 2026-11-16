@@ -227,7 +227,7 @@ function playPcm(connection, pull, label, isWanted) {
 	let stopped = false
 	/** @type {any} the current player */
 	let player = null
-	/** @type {import("./audio").LivePcmStream | null} the current stream */
+	/** @type {import("./audio").LiveOpusStream | null} the current stream */
 	let stream = null
 	/** @type {ReturnType<typeof setTimeout> | null} */
 	let restartTimer = null
@@ -237,7 +237,7 @@ function playPcm(connection, pull, label, isWanted) {
 	function start() {
 		startedAt = Date.now()
 		const currentPlayer = voice.createAudioPlayer({behaviors: {noSubscriber: voice.NoSubscriberBehavior.Play, maxMissedFrames: MAX_MISSED_FRAMES}})
-		const currentStream = new audio.LivePcmStream(pull)
+		const currentStream = new audio.LiveOpusStream(pull)
 		player = currentPlayer
 		stream = currentStream
 		attachLogging(() => {
@@ -254,7 +254,8 @@ function playPcm(connection, pull, label, isWanted) {
 				console.log(`[voice] voice connection to channel ${connection.joinConfig?.channelId}: ${oldState?.status} -> ${newState?.status}`)
 			})
 		})
-		currentPlayer.play(voice.createAudioResource(currentStream, {inputType: voice.StreamType.Raw}))
+		// The packets are already Opus, so the library plays them as they are with no encoder buffering frames ahead
+		currentPlayer.play(voice.createAudioResource(currentStream, {inputType: voice.StreamType.Opus}))
 		const subscription = connection.subscribe(currentPlayer)
 		if (subscription) {
 			console.log(`[voice] ${label} player subscribed to its voice connection`)
@@ -970,8 +971,16 @@ class ChannelBridge {
 		try {
 			const stats = this.stats
 			this.stats = newStats()
+			let underrunReads = 0
+			let droppedSamples = 0
+			for (const participant of this.participants.values()) {
+				const buffer = participant.buffer.stats()
+				underrunReads += buffer.underrunReads
+				droppedSamples += buffer.droppedSamples
+				participant.buffer.reset()
+			}
 			const seconds = STATS_INTERVAL_MS / 1000
-			console.log(`[voice] ${this.channelID} last ${seconds}s: matrixParticipants=${this.participants.size} matrixAudioFrames=${stats.matrixAudio} anchor(nonSilent=${stats.anchor.nonSilent} silent=${stats.anchor.silent}) puppets(nonSilent=${stats.puppet.nonSilent} silent=${stats.puppet.silent}) discordFramesToPublishers=${stats.discordFrames}`)
+			console.log(`[voice] ${this.channelID} last ${seconds}s: matrixParticipants=${this.participants.size} matrixAudioFrames=${stats.matrixAudio} jitterUnderrunReads=${underrunReads} jitterDroppedSamples=${droppedSamples} anchor(nonSilent=${stats.anchor.nonSilent} silent=${stats.anchor.silent}) puppets(nonSilent=${stats.puppet.nonSilent} silent=${stats.puppet.silent}) discordFramesToPublishers=${stats.discordFrames}`)
 		} catch (e) {}
 	}
 }
@@ -1055,6 +1064,12 @@ async function handleDiscordSoundboard(data) {
 		return
 	}
 	const soundID = String(data.sound_id)
+	// A sound our own bot played natively is reported back by Discord as an effect from that bot. Bridging it again would double it.
+	const senderID = String(data.user_id)
+	if (_deps.pool().allBotUserIDs().has(senderID)) {
+		console.log(`[soundboard] not bridged: sent by our own bot ${senderID} (sound ${soundID} in ${where})`)
+		return
+	}
 	const bridge = channelBridges.get(bridgeKey(data.guild_id, data.channel_id))
 	if (!bridge) {
 		console.log(`[soundboard] not bridged: sound ${soundID} was played in ${where}, which is not a bridged channel`)

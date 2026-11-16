@@ -16,7 +16,9 @@ const SAMPLE_RATE = 48000
 const CHANNELS = 1
 const CHUNK_SAMPLES = 960 // 20 ms at 48 kHz mono
 const HALF_CHUNK_SAMPLES = 480 // 10 ms
-const MAX_BEHIND_MS = 200
+/** Most audio the Publisher lets build up behind LiveKit. Also the AudioSource's own queue size, so it never holds more. */
+const MAX_BEHIND_MS = 100
+const SOURCE_QUEUE_MS = MAX_BEHIND_MS
 const MAX_PENDING_FRAMES = MAX_BEHIND_MS / 10
 
 /** @returns {any} */
@@ -130,7 +132,7 @@ class Publisher {
 		await room.connect(this.url, this.jwt, {autoSubscribe: false, dynacast: false})
 		if (this.closed) return
 
-		const source = new rtc.AudioSource(SAMPLE_RATE, CHANNELS)
+		const source = new rtc.AudioSource(SAMPLE_RATE, CHANNELS, SOURCE_QUEUE_MS)
 		this.source = source
 		const track = rtc.LocalAudioTrack.createAudioTrack("discord-audio", source)
 		this.track = track
@@ -142,7 +144,7 @@ class Publisher {
 	}
 
 	/**
-	 * Queues one 20 ms frame. Does not wait for LiveKit. Frames are dropped when more than ~200 ms are queued.
+	 * Queues one 20 ms frame. Does not wait for LiveKit. Frames are dropped when more than ~100 ms are queued.
 	 * @param {Int16Array} samples mono, exactly 960 samples
 	 */
 	pushMono(samples) {
